@@ -1,0 +1,16 @@
+[package]
+name = "glass-demo"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal second liquid-glass consumer: a floating glass panel that shares the session's glass broker with other apps"
+license = "MIT"
+
+[dependencies]
+liquid-glass = { path = ".." }
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }

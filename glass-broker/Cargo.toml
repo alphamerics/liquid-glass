@@ -1,0 +1,11 @@
+[package]
+name = "glass-broker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "glass-broker"
+path = "src/main.rs"
+
+[dependencies]
+liquid-glass = { path = ".." }
