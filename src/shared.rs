@@ -498,12 +498,15 @@ pub(crate) struct BlurPlan {
     /// Blur is effectively off: composites sample the sharp capture
     /// directly, skipping the chain entirely.
     pub(crate) sharp: bool,
-    /// Kawase levels actually used (1..=4). Capped by the radius: the
+    /// Kawase levels actually used (1..=5). Capped by the radius: the
     /// chain's own down/upsampling imposes a minimum blur per level, so a
     /// small radius must use fewer levels no matter the samples setting.
+    /// One more level than before the polish pass: the chain's shallowest
+    /// buffer now runs at base resolution, so each band needs one deeper
+    /// level to reach the same blur at the same slider position.
     pub(crate) levels: usize,
     /// Resolution of the chain's base (down0) level relative to the capture
-    /// (0.5..1.0). Less blur hides less resampling, so lower radii run the
+    /// (0.9..1.0). Less blur hides less resampling, so lower radii run the
     /// chain at a higher resolution to avoid visible pixelation.
     pub(crate) base_scale: f32,
     /// Kawase tap-offset scale.
@@ -517,8 +520,8 @@ pub(crate) struct BlurPlan {
 ///
 /// The per-band ramps make the slider's response CONTINUOUS: within each
 /// level band the tap offsets ramp from their start value to 2.0 while the
-/// base resolution eases down to 0.75, and each deeper band starts at
-/// offset 0.75 / base 1.0 — which, in the `sigma ≈ offsets · 2^levels ·
+/// base resolution eases down to 0.9, and each deeper band starts at
+/// offset 0.9 / base 1.0 — which, in the `sigma ≈ offsets · 2^levels ·
 /// base` model, lands exactly on the previous band's end. Adding a level
 /// therefore never snaps: the new level begins at nearly full resolution
 /// with tiny taps (a gentle addition) and grows gradually from there.
@@ -532,9 +535,11 @@ pub(crate) fn blur_plan(params: &GlassShaderParams) -> BlurPlan {
             offset_scale: 0.0,
         };
     }
-    let samples = (params.blur_samples.round() as usize).clamp(1, 4);
-    // One level covers radii up to ~12px; each extra level roughly doubles
-    // the reach (bands 12-28, 28-64, 64+).
+    let samples = (params.blur_samples.round() as usize).clamp(1, 5);
+    // One extra level covers radii up to ~12px; each extra level roughly
+    // doubles the reach (bands 12-28, 28-64, 64+). `levels` counts the
+    // chain's buffers, so a band of `band_levels` 2x-ish hops runs
+    // `band_levels + 1` buffers (down0 crops at the base scale, not at 2x).
     let (band_levels, band_start, band_end) = if radius < 12.0 {
         (1, 1.0, 12.0)
     } else if radius < 28.0 {
@@ -546,11 +551,11 @@ pub(crate) fn blur_plan(params: &GlassShaderParams) -> BlurPlan {
     };
     let position = ((radius - band_start) / (band_end - band_start)).clamp(0.0, 1.0);
     // Band 1 ramps from the sharp-side minimum (0.25); deeper bands start at
-    // 0.75 to match the previous band's end.
-    let offsets_start = if band_levels == 1 { 0.25 } else { 0.75 };
+    // the base-scale floor (0.9) to match the previous band's end.
+    let offsets_start = if band_levels == 1 { 0.25 } else { 0.9 };
     let offset_scale = (offsets_start + (2.0 - offsets_start) * position).clamp(0.25, 2.0);
-    let base_scale = 1.0 - 0.25 * position;
-    let levels = samples.min(band_levels);
+    let base_scale = 1.0 - 0.1 * position;
+    let levels = samples.min(band_levels + 1);
     BlurPlan {
         sharp: false,
         levels,
@@ -599,21 +604,25 @@ struct KawaseLevel {
     rtv: ID3D11RenderTargetView,
 }
 
-/// The intermediate buffers of the dual-Kawase blur over the whole capture,
-/// at successively halved resolutions. Recreated whenever the frame size or
-/// the level count changes (monitor change, or params that move the level
-/// count).
+/// The intermediate buffers of the dual-Kawase blur over the whole capture.
+/// The down/up halves run at successively halved resolutions while the
+/// `polish` buffer holds the chain's final output at the full base
+/// resolution. Recreated whenever the frame size or the level count changes
+/// (monitor change, or params that move the level count).
 struct KawaseChain {
-    /// Downsampling targets: down[i] is the capture at 1/2^(i+1) resolution.
+    /// Downsampling targets: down[i] is the capture at 1/2^i resolution.
     down: Vec<KawaseLevel>,
     /// Upsampling targets: up[i] matches down[i]'s size; up[i] blends
     /// down[i+1] (deepest) or up[i+1] back toward down[i]'s resolution.
     up: Vec<KawaseLevel>,
-    /// down0/up0 size in pixels: the capture at half resolution scaled by
-    /// the plan's base scale.
+    /// The chain's final output: the shallowest level re-expanded to the
+    /// full `width` × `height` (base) resolution.
+    polish: KawaseLevel,
+    /// down0/up0/polish size in pixels: the capture scaled by the plan's
+    /// base scale.
     width: u32,
     height: u32,
-    /// Configured level count (1..=4).
+    /// Configured level count (1..=5).
     levels: usize,
 }
 
@@ -766,8 +775,9 @@ impl BlurEngine {
                 }
             }
             // Up side: expand from the deepest level back to down0's
-            // resolution; the composites' bilinear sampler finishes the
-            // final 2x upsample.
+            // resolution; the final polish pass then re-expands to the
+            // chain's base resolution so the composite never sees a
+            // half-resolution backdrop.
             for level in (0..chain.up.len()).rev() {
                 let source = if level + 1 == chain.up.len() {
                     &chain.down[chain.levels - 1].srv
@@ -784,14 +794,22 @@ impl BlurEngine {
                     height,
                 );
             }
+            let shallow = match chain.up.first() {
+                Some(shallowest) => &shallowest.srv,
+                // A single level has no up passes; down0 is the source.
+                None => &chain.down[0].srv,
+            };
+            draw_kawase_pass(
+                context,
+                &self.up_shader,
+                &chain.polish,
+                shallow,
+                chain.width,
+                chain.height,
+            );
         }
-        let backdrop = match chain.up.first() {
-            Some(shallowest) => shallowest.srv.clone(),
-            // A single level has no up passes; composites sample down0.
-            None => chain.down[0].srv.clone(),
-        };
         Ok(Backdrop {
-            view: backdrop,
+            view: chain.polish.srv.clone(),
         })
     }
 
@@ -836,12 +854,13 @@ impl BlurEngine {
 }
 
 /// The pixel size of Kawase chain level `level` (down and up buffers share
-/// sizes): the frame at 1/2^(level+1) resolution.
+/// sizes): down0 runs at the chain's full base resolution and every deeper
+/// level halves it.
 fn chain_target_size(chain: &KawaseChain, level: usize) -> (u32, u32) {
-    let shift = (level + 1).min(16) as u32;
+    let shift = level.min(16) as u32;
     (
-        chain.width.div_ceil(1 << shift),
-        chain.height.div_ceil(1 << shift),
+        chain.width.div_ceil(1u32 << shift),
+        chain.height.div_ceil(1u32 << shift),
     )
 }
 
@@ -926,29 +945,32 @@ fn build_kawase_chain(
     height: u32,
     levels: usize,
 ) -> Result<KawaseChain, String> {
-    // down[i] is the capture at 1/2^(i+1); up[i] re-expands back to down[i]'s
-    // size, sourced from down[i+1] (the first up) or up[i+1].
+    // down[i] is the capture at 1/2^i; up[i] re-expands back to down[i]'s
+    // size, sourced from down[i+1] (the first up) or up[i+1]. `polish`
+    // re-expands the shallowest level to the full base resolution.
     let mut down = Vec::with_capacity(levels);
     let mut up = Vec::with_capacity(levels.saturating_sub(1));
     for level in 0..levels {
-        let shift = (level + 1).min(16) as u32;
+        let shift = level.min(16) as u32;
         down.push(create_kawase_level(
             device,
-            width.div_ceil(1 << shift),
-            height.div_ceil(1 << shift),
+            width.div_ceil(1u32 << shift),
+            height.div_ceil(1u32 << shift),
         )?);
     }
     for level in 0..levels.saturating_sub(1) {
-        let shift = (level + 1).min(16) as u32;
+        let shift = level.min(16) as u32;
         up.push(create_kawase_level(
             device,
-            width.div_ceil(1 << shift),
-            height.div_ceil(1 << shift),
+            width.div_ceil(1u32 << shift),
+            height.div_ceil(1u32 << shift),
         )?);
     }
+    let polish = create_kawase_level(device, width, height)?;
     Ok(KawaseChain {
         down,
         up,
+        polish,
         width,
         height,
         levels,
@@ -1077,22 +1099,22 @@ mod tests {
         // Blur off: sharp capture, no chain.
         params.blur_radius_texels = 0.0;
         assert!(blur_plan(&params).sharp);
-        // Default-ish blur (8): a single level at high resolution.
+        // Default-ish blur (8): a shallow chain at high resolution.
         params.blur_radius_texels = 8.0;
         let plan = blur_plan(&params);
         assert!(!plan.sharp);
-        assert_eq!(plan.levels, 1);
-        assert!(plan.base_scale > 0.8);
-        // Level bands at 12 / 28 / 64.
+        assert_eq!(plan.levels, 2);
+        assert!(plan.base_scale > 0.9);
+        // Level bands at 12 / 28 / 64 (one buffer per hop, plus the crop).
         params.blur_radius_texels = 16.0;
-        assert_eq!(blur_plan(&params).levels, 2);
-        params.blur_radius_texels = 32.0;
         assert_eq!(blur_plan(&params).levels, 3);
-        // Subtle blur: still a single level at ~full resolution.
+        params.blur_radius_texels = 32.0;
+        assert_eq!(blur_plan(&params).levels, 4);
+        // Subtle blur: still a shallow chain at ~full resolution.
         params.blur_radius_texels = 2.0;
         let plan = blur_plan(&params);
-        assert_eq!(plan.levels, 1);
-        assert!(plan.base_scale > 0.95);
+        assert_eq!(plan.levels, 2);
+        assert!(plan.base_scale > 0.98);
         // Samples setting only ever caps levels, never raises them.
         params.blur_samples = 1.0;
         params.blur_radius_texels = 32.0;
@@ -1105,7 +1127,9 @@ mod tests {
         // where the next one STARTS — otherwise dragging the radius slider
         // snaps harshly when a level is added.
         let mut params = GlassShaderParams::default();
-        params.blur_samples = 4.0;
+        // The full 5-level headroom: the 64-boundary region needs the fifth
+        // level, and a smaller samples cap would truncate it.
+        params.blur_samples = 5.0;
         let reach = |radius: f32| {
             let plan = blur_plan(&{
                 let mut p = params;

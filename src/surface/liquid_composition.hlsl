@@ -1,6 +1,6 @@
 // The pre-blurred backdrop produced by the dual-Kawase chain (kawase.hlsl):
-// the capture cropped to this surface's surroundings and blurred at half
-// resolution. The composite only ever samples this texture.
+// the capture cropped to this surface's surroundings and blurred at the
+// chain's base resolution. The composite only ever samples this texture.
 Texture2D<float4> glassBackdrop : register(t0);
 SamplerState linearClamp : register(s0);
 

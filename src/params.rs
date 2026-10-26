@@ -78,10 +78,10 @@ pub struct GlassShaderParams {
     /// (the shape is fully open from the first frame and the reveal progress
     /// ramps the glass alpha), 0.0 keeps the bubble/shape reveal.
     pub glass_fade: f32,
-    /// Number of Kawase blur levels (1..=4). Each level halves the
-    /// resolution and roughly doubles the blur reach; more levels give a
-    /// smoother, deeper blur for the same tap count. Rounded and clamped by
-    /// the compositor.
+    /// Upper bound on Kawase blur depth (1..=5 chain levels). The radius
+    /// sets the actual depth: deep chains blur further but lower the
+    /// resolution; more depth gives a smoother, deeper blur for the same
+    /// tap count. Rounded and clamped by the compositor.
     pub blur_samples: f32,
     /// Uniform black border around the silhouette: thickness in surface
     /// pixels (0 disables it) and constant opacity (0..1). Drawn on top of
@@ -126,18 +126,18 @@ impl Default for GlassShaderParams {
             blur_radius_texels: 8.0,
             tint_strength: 0.24,
             reveal_progress: 1.0,
-            glass_tint: [1.0, 0.25, 0.25],
+            glass_tint: [0.0, 0.0, 0.0],
             chromatic_offset_texels: 1.15,
             chromatic_blend: 1.0,
             capsule_radius: 0.5,
             pill_softness: 0.02,
             edge_band: 0.35,
             pointer_influence: 0.0,
-            outline_strength: 1.75,
-            outline_angle_degrees: 280.0,
+            outline_strength: 0.75,
+            outline_angle_degrees: 105.0,
             outline_mirror: 1.0,
-            outline_thickness_px: 2.0,
-            outline_fade_px: 0.0,
+            outline_thickness_px: 4.0,
+            outline_fade_px: 600.0,
             outline_falloff: 1.0,
             reveal_wobble: 1.4,
             turbulence_strength: 12.0,
@@ -149,8 +149,8 @@ impl Default for GlassShaderParams {
             animation_time: 0.0,
             glass_fade: 0.0,
             blur_samples: 4.0,
-            border_thickness_px: 1.0,
-            border_opacity: 0.85,
+            border_thickness_px: 2.5,
+            border_opacity: 0.20,
         }
     }
 }

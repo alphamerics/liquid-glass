@@ -1,16 +1,18 @@
 // Dual-Kawase blur chain, rendered before the liquid composite:
 //
-//   capture --ps_kawase_crop--> down0 (half crop) --ps_kawase_down--> down1
-//   (quarter) --ps_kawase_down--> down2 (eighth) --ps_kawase_up--> up1
-//   (quarter) --ps_kawase_up--> up0 (half crop) --ps_main (composite)-->
-//   back buffer.
+//   capture --ps_kawase_crop--> down0 (base crop) --ps_kawase_down--> down1
+//   (half) --ps_kawase_down--> down2 (quarter) --ps_kawase_up--> up1
+//   (half) --ps_kawase_up--> up0 (base) --ps_kawase_up--> polish (full
+//   base) --ps_stretch (publication)--> back buffer.
 //
-// The composite pass finishes the last 2x upsample itself with its bilinear
-// sampler. Every pass touches 5 (down) or 8 (up) taps instead of the 27 the
+// Every pass touches 5 (down) or 8 (up) taps instead of the 27 the
 // composite used to spend per pixel on its Vogel-disk blur, and the taps run
-// at a fraction of the pixel count (1/4 + 1/16 + 1/64 for the down side,
-// 1/16 + 1/4 back up) so the whole blur costs a few percent of one
-// full-resolution fill.
+// at a fraction of the pixel count so the whole blur costs a fraction of one
+// full-resolution fill. The final polish pass re-expands the shallowest
+// chain level back to the base resolution: without it the composite's
+// backdrop would be the half-resolution up0 magnified 2x by a plain bilinear
+// stretch, which shows up as blocky, pixelated content behind the glass.
+//
 
 Texture2D<float4> sourceTexture : register(t0);
 SamplerState linearClamp : register(s0);
@@ -50,12 +52,15 @@ VertexOutput vs_main(uint vertexId : SV_VertexID) {
     return output;
 }
 
-// First pass: crops the capture down to half resolution over the crop
-// region. Corners sit one capture texel off-center (half a destination
-// texel), the classic dual-filter downsample; weights 4/1/1/1/1.
+// First pass: crops the capture down to the chain's base resolution over
+// the crop region. Corner taps sit at the tent-downsample position (half a
+// destination texel; two source texels for a 2x hop) but never tighter than
+// one source texel: a narrower spread leaves the halving without a
+// prefilter and it aliases into blocky, pixelated output.
+// weights 4/1/1/1/1.
 float4 ps_kawase_crop(VertexOutput input) : SV_Target {
     const float2 captureUv = cropOriginUv + input.uv * cropSizeUv;
-    const float2 offset = captureTexelUv * kawaseScale;
+    const float2 offset = captureTexelUv * max(kawaseScale, 1.0);
     float4 sum = sourceTexture.Sample(linearClamp, captureUv) * 4.0;
     sum += sourceTexture.Sample(linearClamp, captureUv + float2(-offset.x, -offset.y));
     sum += sourceTexture.Sample(linearClamp, captureUv + float2( offset.x, -offset.y));
@@ -65,12 +70,14 @@ float4 ps_kawase_crop(VertexOutput input) : SV_Target {
 }
 
 // Intermediate down pass: source and destination differ by 2x, so corner
-// taps at one source texel land half a destination texel out.
+// taps at one source texel land half a destination texel out. As in the
+// crop pass, the taps never collapse tighter than one source texel or the
+// halving aliases.
 float4 ps_kawase_down(VertexOutput input) : SV_Target {
     uint width;
     uint height;
     sourceTexture.GetDimensions(width, height);
-    const float2 offset = kawaseScale / float2(width, height);
+    const float2 offset = max(kawaseScale, 1.0) / float2(width, height);
     float4 sum = sourceTexture.Sample(linearClamp, input.uv) * 4.0;
     sum += sourceTexture.Sample(linearClamp, input.uv + float2(-offset.x, -offset.y));
     sum += sourceTexture.Sample(linearClamp, input.uv + float2( offset.x, -offset.y));
