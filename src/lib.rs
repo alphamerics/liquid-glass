@@ -43,6 +43,7 @@ pub mod params;
 pub mod broker;
 mod shared;
 mod surface;
+pub mod thumbnail;
 
 pub(crate) mod capture;
 
@@ -52,6 +53,7 @@ pub use surface::{
     translate_compositor, translate_surface_window, D3D11Compositor, GlassSurface,
     SharedCompositor,
 };
+pub use thumbnail::ThumbnailSurface;
 
 /// Mirrors the shader's `SourceRect` constant buffer (register b0).
 #[repr(C)]

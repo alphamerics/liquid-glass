@@ -25,33 +25,37 @@ pub struct GlassShaderParams {
     pub capsule_radius: f32,
     /// Anti-aliased softness of the capsule edge, in normalized units. The
     /// shader clamps the effective softness to a constant ~1.25px so the rim
-    /// (and the outline riding it) stays equally crisp on any surface size.
+    /// (and the specular glint riding it) stays equally crisp on any surface
+    /// size.
     pub pill_softness: f32,
     /// Width of the refracting edge band, in normalized units.
     pub edge_band: f32,
     /// How strongly cursor movement bends the glass (texel-uv scale per
     /// screen-pixel of cursor delta). 0 disables pointer-driven refraction.
     pub pointer_influence: f32,
-    /// Brightness of the angular gradient outline (0 disables it).
+    /// Brightness of the specular rim lighting (0 disables it).
     pub outline_strength: f32,
-    /// Light direction for the outline, in degrees. 0 = right, 90 = down,
-    /// 180 = left. Acts as an opacity falloff: border edges facing the light
-    /// (within a 60 degree flat cone) are fully opaque, easing to invisible
-    /// across the terminator; the line's width never varies.
+    /// Light direction for the rim, in degrees. 0 = right, 90 = down,
+    /// 180 = left. The border behaves as a raised polished ridge: edges
+    /// whose bevel faces the light catch a specular glint, easing off
+    /// smoothly as the surface normal turns away.
     pub outline_angle_degrees: f32,
-    /// Strength of the mirrored outline lobe on the opposite side, as a
-    /// fraction of `outline_strength` (1.0 = a full mirrored line).
+    /// Strength of the mirrored glint on the opposite side, as a fraction
+    /// of `outline_strength` (1.0 = a full mirrored glint).
     pub outline_mirror: f32,
-    /// Outline line thickness in surface pixels.
+    /// Width of the polished bevel the rim light responds on, in surface
+    /// pixels. The bevel's surface normal tilts from fully outward at the
+    /// rim to fully up at its inner edge.
     pub outline_thickness_px: f32,
-    /// Distance in surface pixels over which the outline's opacity fades out
-    /// from its lit corner anchor along the border. `0.0` auto-sizes to a
+    /// Distance in surface pixels over which the rim light fades out from
+    /// its lit corner anchor along the border. `0.0` auto-sizes to a
     /// quarter of the half-perimeter (the same border share lit on any
     /// surface size); explicit values are capped there so the front and
     /// mirrored lobes never overlap.
     pub outline_fade_px: f32,
-    /// Sharpness of the outline's angular terminator: higher values ease
-    /// the opacity falloff to zero more tightly around the light direction.
+    /// Polish of the rim: higher values tighten the specular glint into a
+    /// thinner, sharper line (mirror-polished), lower values spread it into
+    /// a wider, softer sheen (brushed).
     pub outline_falloff: f32,
     /// Amplitude of the sine wobble during the reveal, in texels.
     pub reveal_wobble: f32,
@@ -84,12 +88,29 @@ pub struct GlassShaderParams {
     /// tap count. Rounded and clamped by the compositor.
     pub blur_samples: f32,
     /// Uniform black border around the silhouette: thickness in surface
-    /// pixels (0 disables it) and constant opacity (0..1). Drawn on top of
-    /// the angular outline with no light response. Occupies the struct's
+    /// pixels (0 disables it) and constant opacity (0..1). Drawn with no
+    /// light response — it reads as the ridge's shaded outer wall that the
+    /// specular glint rides over. Occupies the struct's
     /// former reserved padding so the constant buffer stays eight 16-byte
     /// rows.
     pub border_thickness_px: f32,
     pub border_opacity: f32,
+    /// Adaptive luminance-aware blend (vibrancy): how strongly the tint
+    /// strength adapts per pixel to the contrast between the backdrop's
+    /// luminance and the tint's luminance. 0 = uniform tint (the legacy
+    /// alpha blend), 1 = fully adaptive: bright content behind a dark
+    /// glass pulls in proportionally more tint, dark content stays clear.
+    pub vibrancy: f32,
+    /// Chroma boost applied to the backdrop before the tint blend (0..1).
+    /// the glass re-saturates the background by its own chroma, so the
+    /// glass keeps the colorful character of what is behind it.
+    pub vibrancy_saturation: f32,
+    /// Strength of the rim's inner contact shadow on the bevel slope turned
+    /// away from the light (0 disables it). This is what sells the specular
+    /// rim as a physically raised ridge.
+    pub rim_shadow_strength: f32,
+    /// Reserved padding keeping the constant buffer at eight 16-byte rows.
+    pub vibrancy_padding: [f32; 1],
 }
 
 /// Configurable reveal animation, reusable by any liquid glass surface.
@@ -122,8 +143,8 @@ impl Default for RevealAnimation {
 impl Default for GlassShaderParams {
     fn default() -> Self {
         Self {
-            refraction_strength: 9.0,
-            blur_radius_texels: 8.0,
+            refraction_strength: 30.0,
+            blur_radius_texels: 9.0,
             tint_strength: 0.24,
             reveal_progress: 1.0,
             glass_tint: [0.0, 0.0, 0.0],
@@ -133,8 +154,8 @@ impl Default for GlassShaderParams {
             pill_softness: 0.02,
             edge_band: 0.35,
             pointer_influence: 0.0,
-            outline_strength: 0.75,
-            outline_angle_degrees: 105.0,
+            outline_strength: 2.05,
+            outline_angle_degrees: 110.0,
             outline_mirror: 1.0,
             outline_thickness_px: 4.0,
             outline_fade_px: 600.0,
@@ -151,6 +172,10 @@ impl Default for GlassShaderParams {
             blur_samples: 4.0,
             border_thickness_px: 2.5,
             border_opacity: 0.20,
+            vibrancy: 0.69,
+            vibrancy_saturation: 0.44,
+            rim_shadow_strength: 0.35,
+            vibrancy_padding: [0.0; 1],
         }
     }
 }
@@ -180,27 +205,38 @@ pub struct Material {
     /// RGB tint color mixed over the glass.
     #[serde(rename = "tintColor")]
     pub glass_tint: [f32; 3],
+    /// Adaptive luminance-aware blend (vibrancy): how strongly the tint
+    /// strength adapts per pixel to the backdrop's luminance contrast
+    /// (0 = uniform tint, 1 = fully adaptive).
+    pub vibrancy: f32,
+    /// Chroma boost applied to the backdrop before the tint blend (0..1).
+    pub vibrancy_saturation: f32,
     /// Width of the refracting edge band, in normalized units.
     pub edge_band: f32,
     /// Chromatic aberration offset at the edge, in texels.
     pub chromatic_offset: f32,
     /// How far chromatic aberration reaches inward from the edge.
     pub chromatic_blend: f32,
-    /// Brightness of the angular gradient outline (0 disables it).
+    /// Brightness of the specular rim lighting (0 disables it).
     pub outline_strength: f32,
-    /// Outline line thickness in surface pixels.
+    /// Width of the polished bevel the rim light responds on, in surface
+    /// pixels.
     pub outline_thickness: f32,
-    /// Light direction for the outline, in degrees.
+    /// Light direction for the rim, in degrees.
     pub outline_angle: f32,
-    /// Strength of the mirrored outline lobe, as a fraction of strength.
+    /// Strength of the mirrored glint on the opposite side, as a fraction
+    /// of strength.
     pub outline_mirror: f32,
-    /// Distance in surface pixels over which the outline's opacity fades
+    /// Distance in surface pixels over which the rim light fades
     /// along the border.
     pub outline_fade: f32,
     /// Uniform black border thickness in surface pixels (0 disables it).
     pub border_thickness: f32,
     /// Uniform black border opacity (0..1).
     pub border_opacity: f32,
+    /// Strength of the rim's inner contact shadow on the slope turned away
+    /// from the light (0 disables it).
+    pub rim_shadow: f32,
     /// Turbulence warp amplitude, in surface pixels.
     pub turbulence_strength: f32,
     /// Turbulence noise frequency (higher = smaller, busier bubbles).
@@ -226,6 +262,8 @@ impl Material {
             blur_samples: params.blur_samples,
             tint_strength: params.tint_strength,
             glass_tint: params.glass_tint,
+            vibrancy: params.vibrancy,
+            vibrancy_saturation: params.vibrancy_saturation,
             edge_band: params.edge_band,
             chromatic_offset: params.chromatic_offset_texels,
             chromatic_blend: params.chromatic_blend,
@@ -236,6 +274,7 @@ impl Material {
             outline_fade: params.outline_fade_px,
             border_thickness: params.border_thickness_px,
             border_opacity: params.border_opacity,
+            rim_shadow: params.rim_shadow_strength,
             turbulence_strength: params.turbulence_strength,
             turbulence_scale: params.turbulence_scale,
             reveal_wobble: params.reveal_wobble,
@@ -244,8 +283,8 @@ impl Material {
 
     /// Writes the material fields into a params set, preserving everything
     /// surface-specific (reveal progress, capsule radius, pill scale,
-    /// animation time, pointer influence, glass fade, reveal origin, the
-    /// outline terminator sharpness). `texel_scale` compensates texel-unit
+    /// animation time, pointer influence, glass fade, reveal origin).
+    /// `texel_scale` compensates texel-unit
     /// fields for a downscaled shared capture, exactly like
     /// `GlassSurface::set_shader_params` does for caller-provided params.
     pub fn apply_onto(&self, params: &mut GlassShaderParams, texel_scale: f32) {
@@ -255,6 +294,8 @@ impl Material {
         params.blur_samples = self.blur_samples;
         params.tint_strength = self.tint_strength;
         params.glass_tint = self.glass_tint;
+        params.vibrancy = self.vibrancy;
+        params.vibrancy_saturation = self.vibrancy_saturation;
         params.edge_band = self.edge_band;
         params.chromatic_blend = self.chromatic_blend;
         params.outline_strength = self.outline_strength;
@@ -264,6 +305,7 @@ impl Material {
         params.outline_fade_px = self.outline_fade;
         params.border_thickness_px = self.border_thickness;
         params.border_opacity = self.border_opacity;
+        params.rim_shadow_strength = self.rim_shadow;
         params.turbulence_strength = self.turbulence_strength;
         params.turbulence_scale = self.turbulence_scale;
         params.reveal_wobble = self.reveal_wobble;
@@ -291,6 +333,8 @@ impl Material {
                 .and_then(|v| serde_json::from_value::<[f64; 3]>(v.clone()).ok())
                 .map(|rgb| [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32])
                 .unwrap_or(defaults.glass_tint),
+            vibrancy: number("vibrancy", defaults.vibrancy),
+            vibrancy_saturation: number("vibrancySaturation", defaults.vibrancy_saturation),
             edge_band: number("edgeBand", defaults.edge_band),
             chromatic_offset: number("chromaticOffset", defaults.chromatic_offset),
             chromatic_blend: number("chromaticBlend", defaults.chromatic_blend),
@@ -301,6 +345,7 @@ impl Material {
             outline_fade: number("outlineFade", defaults.outline_fade),
             border_thickness: number("borderThickness", defaults.border_thickness),
             border_opacity: number("borderOpacity", defaults.border_opacity),
+            rim_shadow: number("rimShadow", defaults.rim_shadow),
             turbulence_strength: number("turbulenceStrength", defaults.turbulence_strength),
             turbulence_scale: number("turbulenceScale", defaults.turbulence_scale),
             reveal_wobble: number("wobble", defaults.reveal_wobble),

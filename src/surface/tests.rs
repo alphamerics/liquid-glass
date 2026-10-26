@@ -48,7 +48,7 @@ fn source_rectangle_maps_overlay_into_primary_capture() {
 fn glass_shader_params_layout_matches_16_byte_constant_rows() {
     assert_eq!(
         size_of::<GlassShaderParams>(),
-        size_of::<[f32; 32]>(),
-        "GlassShaderParams must stay exactly eight 16-byte constant rows"
+        size_of::<[f32; 36]>(),
+        "GlassShaderParams must stay exactly nine 16-byte constant rows"
     );
 }

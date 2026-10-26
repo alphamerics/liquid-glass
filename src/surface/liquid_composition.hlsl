@@ -60,6 +60,18 @@ cbuffer GlassParams : register(b1) {
     // buffer stays eight 16-byte rows.
     float borderThicknessPx;
     float borderOpacity;
+    // Adaptive luminance-aware blend (vibrancy): how strongly the tint
+    // strength adapts per pixel to the contrast between the backdrop's
+    // luminance and the tint's (0 = uniform tint, the legacy alpha blend).
+    float vibrancy;
+    // Chroma boost applied to the backdrop before the tint blend (0..1):
+    // the glass re-saturates the background by its own chroma.
+    float vibrancySaturation;
+    // Strength of the rim's inner contact shadow on the side turned away
+    // from the light (0 disables it).
+    float rimShadowStrength;
+    // Layout parity with GlassShaderParams' reserved padding.
+    float vibrancyPadding;
 };
 
 // Geometry of the Kawase chain's crop region, uploaded by the compositor
@@ -297,55 +309,104 @@ float4 ps_main(VertexOutput input) : SV_Target {
     const float red = sampleBackdrop(refractedUv - chromatic).r;
     const float blue = sampleBackdrop(refractedUv + chromatic).b;
     const float3 dispersed = lerp(blurred, float3(red, blurred.g, blue), edgeStrength * chromaticBlend);
-    const float3 tinted = lerp(dispersed, glassTint, tintStrength);
-    // Crisp outline line hugging the whole border at outlineThicknessPx. The
-    // band profile depends only on the SDF band, so the line's width is
-    // identical on straight runs and corners; the light direction and the
-    // anchor fade act purely as an opacity falloff — the whole band fades
-    // uniformly and never thins. The gates are a flat cone: fully lit within
-    // 60 degrees of the light, easing to zero across the terminator, so
-    // straight runs and the corner joining them share one brightness. A
-    // mirrored anchor repeats the lobe on the opposite side.
+    // ---- Adaptive Luminance-Aware Blend (vibrancy) ----
+    // A uniform tint ignores what is behind the glass: a bright window washes
+    // the glass out and a dark one turns it into a flat black block. Instead,
+    // the backdrop sample that is already in `dispersed` is worked per pixel:
+    //   1. Vibrancy: re-saturate the backdrop by its own chroma, so the glass
+    //      keeps the colorful character of what is behind it.
+    //   2. Luminance-aware strength: the more a pixel's luminance disagrees
+    //      with the tint's luminance (contrast), the more tint is pulled in
+    //      for that pixel — bright content behind a dark glass darkens the
+    //      glass there, dark content lets it stay clear. Every pixel adapts
+    //      toward the legible band, so foreground elements stay legible.
+    // With vibrancy = 0 and vibrancySaturation = 0 this collapses to the
+    // legacy uniform `lerp(dispersed, glassTint, tintStrength)`.
+    const float backdropLuma = dot(dispersed, float3(0.2126, 0.7152, 0.0722));
+    const float tintLuma = dot(glassTint, float3(0.2126, 0.7152, 0.0722));
+    const float3 vibrant = dispersed
+        + (dispersed - backdropLuma) * vibrancySaturation;
+    const float lumaContrast = abs(backdropLuma - tintLuma);
+    const float adaptiveStrength = saturate(
+        tintStrength * lerp(1.0, 1.0 + lumaContrast * 2.0, vibrancy));
+    const float3 tinted = lerp(vibrant, glassTint, adaptiveStrength);
+    // ---- Specular rim lighting ----
+    // The border is a raised, polished ridge: a quarter-round bevel filling
+    // the outermost outlineThicknessPx of the glass. Its surface normal
+    // tilts from fully outward at the crest (the rim) to fully up where it
+    // merges into the flat glass, so a Phong lobe against the light lights
+    // the ridge the way light catches a physical polished edge: a glint
+    // whose core sits just below the crest, whose brightness turns smoothly
+    // around corners as the edge normal rotates away from the light, and
+    // which slides slightly down the slope on oblique edges. The light is
+    // added over the glass (never blended toward flat white), so it reads as
+    // illumination landing on the surface rather than a drawn border line.
     const float signedDistancePx = signedDistance * surfaceHeightPx;
+    const float distanceToBorderPx = max(-signedDistancePx, 0.0);
     const float lightAngle = radians(outlineAngleDegrees);
     const float2 lightDir = float2(cos(lightAngle), sin(lightAngle));
-    const float facing = dot(edgeNormal, lightDir);
-    const float frontGate = pow(saturate(facing * 2.0), outlineFalloff);
-    const float backGate = pow(saturate(-facing * 2.0), outlineFalloff);
+    // The light sits 30 degrees off the glass plane: low enough that grazing
+    // light catches the polished crest hardest, high enough that the bevel
+    // slope still answers on oblique edges.
+    const float3 frontLight = normalize(float3(lightDir, 0.5));
+    const float3 backLight = normalize(float3(-lightDir, 0.5));
+    // Quarter-round bevel normal. At bevel depth u (0 = the crest, 1 = the
+    // bevel's inner edge) the normal is (1 - u) outward along the edge
+    // normal and sqrt(2u - u^2) up — components that already square-sum to
+    // one, so no re-normalization is needed.
+    const float bevelWidth = max(outlineThicknessPx, 1e-4);
+    const float bevelU = saturate(distanceToBorderPx / bevelWidth);
+    const float3 bevelNormal = float3(
+        edgeNormal * (1.0 - bevelU),
+        sqrt(max(2.0 * bevelU - bevelU * bevelU, 0.0)));
     // The border point facing the light: the corner-circle center in the
     // light's quadrant, pushed out along the light direction onto the rim.
     const float2 capsuleBounds = float2(aspect * 0.5 - capsuleRadius, 0.5 - capsuleRadius);
     const float2 anchor = sign(lightDir) * capsuleBounds + lightDir * capsuleRadius;
     // Fade distance along the border from the lit corner. Auto = a quarter
     // of the half-perimeter, so the same share of the border is lit on any
-    // surface size; an explicit pixel fade is capped there so the two lobes
-    // can never overlap and sum into double opacity on small surfaces.
+    // surface size; an explicit pixel fade is capped there so the front and
+    // mirrored lobes can never overlap and sum into double brightness on
+    // small surfaces.
     const float autoFadePx = (surfaceWidthPx + surfaceHeightPx) * 0.25;
     const float fadePx = outlineFadePx > 0.0
         ? min(outlineFadePx, autoFadePx)
         : autoFadePx;
     const float frontFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition - anchor) * surfaceHeightPx);
     const float backFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition + anchor) * surfaceHeightPx);
-    const float rimLineMask = 1.0 - smoothstep(0.0, outlineThicknessPx, max(-signedDistancePx, 0.0));
-    // Opacity falloff only: gates and fade multiply the line's opacity over
-    // the glass; the band's width never changes.
-    const float rimOpacity = saturate(
-        (frontGate * frontFade + outlineMirror * backGate * backFade)
-        * rimLineMask * outlineStrength);
-    // The outline is blended over the glass (never added) so it stays a
-    // consistent, slightly transparent line regardless of the captured
-    // content behind it.
-    const float3 outlined = lerp(tinted, float3(1.0, 1.0, 1.0), rimOpacity);
+    // The polish: a tight specular glint over a soft broad sheen. The glint
+    // carries the "light catching the ridge" read; the sheen keeps the whole
+    // lit slope visibly raised between glints.
+    const float gloss = lerp(12.0, 64.0, saturate(outlineFalloff));
+    const float frontFacing = saturate(dot(bevelNormal, frontLight));
+    const float backFacing = saturate(dot(bevelNormal, backLight));
+    const float frontGlint = pow(frontFacing, gloss) * 1.15;
+    const float backGlint = pow(backFacing, gloss * 2.0) * 0.55;
+    const float sheen = 0.25 * (pow(frontFacing, 3.0) + pow(backFacing, 3.0));
+    // The lobes only exist on the bevel itself: bandMask eases them out
+    // across the bevel width so the flat glass interior stays unlit.
+    const float bandMask = 1.0 - smoothstep(0.0, bevelWidth, distanceToBorderPx);
+    const float3 rimLight = float3(1.0, 1.0, 1.0)
+        * saturate(((frontGlint + sheen) * frontFade
+            + (outlineMirror * backGlint + sheen) * backFade)
+            * bandMask * outlineStrength);
     // A uniform black border owning the outermost band of the silhouette:
-    // the same SDF band mechanics as the outline but with no light response
-    // — full border opacity at the rim, easing inward over its thickness.
-    // Drawn on top of the white outline so the two read as a dark contour
-    // with the lit line riding just inside it.
+    // the same SDF band mechanics but with no light response — full border
+    // opacity at the rim, easing inward over its thickness. It reads as the
+    // ridge's shaded outer wall.
     const float borderMask =
-        1.0 - smoothstep(0.0, max(borderThicknessPx, 1e-4), max(-signedDistancePx, 0.0));
-    const float3 bordered = lerp(outlined, float3(0.0, 0.0, 0.0), saturate(borderMask * borderOpacity));
+        1.0 - smoothstep(0.0, max(borderThicknessPx, 1e-4), distanceToBorderPx);
+    const float3 bordered = lerp(tinted, float3(0.0, 0.0, 0.0), saturate(borderMask * borderOpacity));
+    // Contact shadow: the bevel slope turned away from the light falls into
+    // shade, deepening toward the crest and vanishing as the normal tilts
+    // back up toward the glass plane. This is what sells the ridge as raised.
+    const float rimShadow = pow(saturate(-dot(bevelNormal, frontLight)), 2.0)
+        * bandMask * rimShadowStrength;
+    // Rim lighting applies after the contour so the glint rides over the
+    // shaded outer wall exactly where a polished edge catches light.
+    const float3 shaded = bordered * (1.0 - rimShadow) + rimLight;
     // The SDF controls coverage and distortion only; it never adds an edge
     // color. The composition swap chain expects premultiplied alpha, so the
     // color is scaled by the capsule coverage for smooth antialiased edges.
-    return float4(saturate(bordered) * pillMask, pillMask);
+    return float4(saturate(shaded) * pillMask, pillMask);
 }
