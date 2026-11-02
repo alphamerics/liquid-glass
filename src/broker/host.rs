@@ -52,7 +52,8 @@ use super::protocol::{
 };
 use crate::capture::CaptureFeed;
 use crate::params::GlassShaderParams;
-use crate::shared::{blur_plan, Backdrop, BlurEngine};
+use crate::quality::{detect_gpu_class, fullscreen_foreground, resolve, QualityCaps};
+use crate::shared::{blur_plan_with_caps, Backdrop, BlurEngine};
 use crate::surface::create_d3d11_device;
 
 /// The idle feed grace while consumers still exist but no one is active
@@ -86,6 +87,11 @@ const MUTEX_KEY: u64 = 0;
 /// when `OpenProcess` names a pid that no longer exists (any other
 /// failure means the process is alive but out of reach).
 const DEAD_PID_HRESULT: HRESULT = HRESULT(0x8007_0057u32 as i32);
+/// How often the publish loop re-checks the fullscreen-foreground state
+/// (the shell query gates the backdrop rate under fullscreen apps).
+const FULLSCREEN_POLL: Duration = Duration::from_millis(500);
+/// How often the publish loop re-checks battery (Auto tiers only).
+const POWER_POLL: Duration = Duration::from_secs(10);
 
 /// The broker's entry point: owns the shared manifest, the capture feed
 /// and the publication; exits when the last consumer releases. Non-zero
@@ -152,6 +158,15 @@ pub fn run() -> i32 {
         .checked_sub(MAINTENANCE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let my_pid = std::process::id();
+    // The quality tier: resolved from the material's mode on this
+    // machine's GPU class (and battery), re-checked on material change,
+    // battery transition and fullscreen-foreground transitions.
+    let gpu_class = detect_gpu_class(&device);
+    let mut quality_mode = material.quality;
+    let mut quality_caps = resolve(quality_mode, gpu_class);
+    let mut fullscreen = false;
+    let mut last_fullscreen_check: Option<Instant> = None;
+    let mut last_power_check: Option<Instant> = None;
 
     loop {
         std::thread::sleep(Duration::from_millis(16));
@@ -160,12 +175,47 @@ pub fn run() -> i32 {
         // refresh) and the frame/backdrop refresh + publication cycle.
         material.poll(&mut engine.params);
         let material_revision = material.revision();
+        if material.quality != quality_mode {
+            quality_mode = material.quality;
+            quality_caps = resolve(quality_mode, gpu_class);
+            // The chain caps live outside the params fingerprint: the
+            // backdrop must rebuild even if the material revision didn't
+            // move.
+            engine.invalidate_backdrop();
+        }
+        let now = Instant::now();
+        if last_fullscreen_check
+            .map_or(true, |at| now.duration_since(at) >= FULLSCREEN_POLL)
+        {
+            last_fullscreen_check = Some(now);
+            fullscreen = fullscreen_foreground();
+        }
+        if last_power_check.map_or(true, |at| now.duration_since(at) >= POWER_POLL) {
+            last_power_check = Some(now);
+            let battery = crate::quality::on_battery();
+            if material.battery_seen != Some(battery) {
+                material.battery_seen = Some(battery);
+                quality_caps = resolve(quality_mode, gpu_class);
+                engine.invalidate_backdrop();
+            }
+        }
+        // The capture callback's copy gate reads the interval through the
+        // host; the publication rate follows the copy rate automatically.
+        host.lock()
+            .expect("broker host lock poisoned")
+            .set_backdrop_interval(quality_caps.backdrop_interval(fullscreen));
         {
             let host_guard = host.lock().expect("broker host lock poisoned");
             let host_version = host_guard.frame_version.load(Ordering::Acquire);
-            engine.refresh(&context, &host_guard, host_version, material_revision);
+            engine.refresh(
+                &context,
+                &host_guard,
+                host_version,
+                material_revision,
+                &quality_caps,
+            );
             if let Err(error) =
-                engine.publish_inner(&device, &context, &host_guard, manifest, host_version)
+                engine.publish_inner(&device, &context, &host_guard, manifest, host_version, &quality_caps)
             {
                 if last_publish_error.as_deref() != Some(error.as_str()) {
                     eprintln!("glass broker publish failed: {error}");
@@ -407,6 +457,13 @@ impl PublishEngine {
         }
     }
 
+    /// Drops the cached backdrop so the next refresh rebuilds it (a tier
+    /// change alters the chain caps, which the version/revision
+    /// fingerprint alone cannot see).
+    fn invalidate_backdrop(&mut self) {
+        self.backdrop = None;
+    }
+
     /// Refreshes the shared backdrop when a fresh capture frame or a
     /// material revision landed; static desktops re-use the last one.
     fn refresh(
@@ -415,6 +472,7 @@ impl PublishEngine {
         host: &BrokerHost,
         host_version: u64,
         material_revision: u64,
+        caps: &QualityCaps,
     ) {
         if self.backdrop_version == host_version && self.backdrop_material == material_revision {
             return;
@@ -426,7 +484,7 @@ impl PublishEngine {
             host.frame_size.Width.max(1) as u32,
             host.frame_size.Height.max(1) as u32,
         ];
-        match self.blur.render(context, view, size, &self.params) {
+        match self.blur.render(context, view, size, &self.params, caps) {
             Ok(backdrop) => {
                 self.backdrop = Some(backdrop);
                 self.backdrop_version = host_version;
@@ -558,6 +616,7 @@ impl PublishEngine {
         host: &BrokerHost,
         manifest: &Manifest,
         version: u64,
+        caps: &QualityCaps,
     ) -> Result<(), String> {
         // No backdrop yet, or already published: nothing to do.
         let backdrop_view = match self.backdrop.as_ref() {
@@ -570,7 +629,7 @@ impl PublishEngine {
         // The sharp-path source is resolved BEFORE the pair's work (and
         // crucially before the keyed-mutex acquire): an early return after
         // the acquire would have to release the mutex first.
-        let sharp = blur_plan(&self.params).sharp;
+        let sharp = blur_plan_with_caps(&self.params, caps).sharp;
         let sharp_source = if sharp {
             match host.stable.as_ref() {
                 Some((stable, _)) => Some(stable.clone()),
@@ -661,6 +720,11 @@ pub(crate) struct BrokerHost {
     frame_size: SizeInt32,
     frame_version: Arc<AtomicU64>,
     registry: Arc<ConsumerRegistry>,
+    /// The quality tier's backdrop rate cap (the publish loop writes it;
+    /// the capture callback reads it through `capture_due`).
+    backdrop_interval: Option<Duration>,
+    /// When the last capture blit ran (rate-cap bookkeeping).
+    last_copy: Option<Instant>,
 }
 
 unsafe impl Send for BrokerHost {}
@@ -695,6 +759,16 @@ impl crate::capture::FrameHost for BrokerHost {
     fn any_active(&self) -> bool {
         self.registry.any_active()
     }
+
+    fn capture_due(&mut self) -> bool {
+        let due = self.backdrop_interval.map_or(true, |interval| {
+            self.last_copy.map_or(true, |last| last.elapsed() >= interval)
+        });
+        if due {
+            self.last_copy = Some(Instant::now());
+        }
+        due
+    }
 }
 
 impl BrokerHost {
@@ -710,7 +784,13 @@ impl BrokerHost {
             frame_size: SizeInt32::default(),
             frame_version: Arc::new(AtomicU64::new(0)),
             registry,
+            backdrop_interval: None,
+            last_copy: None,
         }
+    }
+
+    fn set_backdrop_interval(&mut self, interval: Option<Duration>) {
+        self.backdrop_interval = interval;
     }
 
     fn version_counter(&self) -> Arc<AtomicU64> {
@@ -728,6 +808,11 @@ struct MaterialWatcher {
     /// A monotonically increasing revision; any change bumps it, and the
     /// publication's backdrop keys off it.
     revision: u64,
+    /// The last material's quality mode (the publish loop resolves the
+    /// tier from it).
+    quality: crate::quality::QualityMode,
+    /// The last battery state (Auto tiers re-resolve on transitions).
+    battery_seen: Option<bool>,
 }
 
 impl MaterialWatcher {
@@ -736,10 +821,13 @@ impl MaterialWatcher {
         if let Err(error) = super::seed_material_if_missing() {
             eprintln!("glass broker material seed failed: {error}");
         }
+        let quality = super::read_material().quality;
         Self {
             path,
             last_mtime: None,
             revision: 1,
+            quality,
+            battery_seen: None,
         }
     }
 
@@ -761,6 +849,7 @@ impl MaterialWatcher {
         }
         self.last_mtime = mtime;
         let material = super::read_material();
+        self.quality = material.quality;
         let mut updated = *params;
         // The broker's capture and publication run at full monitor
         // resolution, so no texel scaling applies here (texel scale 1.0).

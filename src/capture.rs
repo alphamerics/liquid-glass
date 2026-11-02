@@ -16,11 +16,16 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 
 use windows::{
     core::Interface,
+    Foundation::TimeSpan,
     Graphics::{
-        Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
+        Capture::{
+            Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem,
+            GraphicsCaptureSession,
+        },
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
         SizeInt32,
     },
@@ -65,6 +70,10 @@ pub(crate) trait FrameHost: Send {
     /// Whether any consumer of this host is actively rendering (windows
     /// visible); `false` lets the feed skip its per-frame GPU blit.
     fn any_active(&self) -> bool;
+    /// Whether a frame copy may run now (the host owns the quality
+    /// tier's backdrop rate cap). Returns `true` and stamps the copy
+    /// time when the copy is allowed.
+    fn capture_due(&mut self) -> bool;
 }
 
 /// `CreateDirect3D11DeviceFromDXGIDevice` produces an agile WinRT wrapper
@@ -88,6 +97,26 @@ pub(crate) struct CaptureFeed {
     frame_arrived_token: windows::Foundation::EventRegistrationToken,
     #[allow(dead_code)]
     render_running: Arc<AtomicBool>,
+}
+
+impl CaptureFeed {
+    /// Applies the quality tier's backdrop rate as WGC's own minimum frame
+    /// interval (Windows 11 22H2+): the OS coalesces frame deliveries, so
+    /// the callback — and its full-monitor blit — do not even run above
+    /// the cap. Older systems ignore this and rely on the callback's
+    /// `capture_due` gate instead.
+    pub(crate) fn set_min_update_interval(&self, interval: Option<Duration>) {
+        let Some(interval) = interval else {
+            return;
+        };
+        // WinRT TimeSpan ticks are 100-ns units. The class wrapper casts
+        // to IGraphicsCaptureSession5 internally (a no-op failure on
+        // systems without it).
+        let ticks = (interval.as_nanos().min(i64::MAX as u128) / 100) as i64;
+        let _ = self
+            .session
+            .SetMinUpdateInterval(TimeSpan { Duration: ticks });
+    }
 }
 
 impl CaptureFeed {
@@ -144,6 +173,17 @@ impl CaptureFeed {
             eprintln!("glass capture border stays on (needs the packaged graphicsCaptureProgrammatic capability): {error}");
         }
 
+        // Windows 11 24H2: ask WGC to report dirty regions per frame. The
+        // callback then skips frames whose content is unchanged entirely —
+        // without this, every DWM recomposition (any window's caret blink,
+        // clock tick, or the glass app's own DOM update) re-runs the
+        // full-monitor blit and blur even though nothing visible changed.
+        // Older systems fail the call silently and fall back to the rate
+        // cap alone.
+        let dirty_regions = session
+            .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly)
+            .is_ok();
+
         {
             let mut host = host.lock().expect("glass host lock poisoned");
             let frame = create_frame_texture(&device, scaled);
@@ -195,7 +235,7 @@ impl CaptureFeed {
                 Ok(texture) => texture,
                 Err(_) => return Ok(()),
             };
-            if let Some(stable) = host.frame_texture() {
+            if let Some(stable) = host.frame_texture().cloned() {
                 // WGC recycles its frame surfaces, so the newest frame must
                 // be copied out before the callback returns. But the copy is
                 // a full-monitor GPU blit — skip it entirely when every
@@ -203,11 +243,30 @@ impl CaptureFeed {
                 // GPU on frames it will never render (the first frame after
                 // any surface resumes refreshes the texture).
                 if host.any_active() {
-                    let context = host.copy_context();
-                    unsafe {
-                        context.CopyResource(stable, &texture);
+                    // Unchanged-content skip (24H2 dirty regions): a frame
+                    // with no dirty regions is a recomposition with identical
+                    // pixels — copying it would re-run the whole blur chain
+                    // for nothing. The render loop force-refreshes the
+                    // backdrop on a slow cadence, so a misreported frame at
+                    // worst costs two seconds of staleness.
+                    if dirty_regions
+                        && frame
+                            .DirtyRegions()
+                            .map_or(false, |regions| regions.Size() == Ok(0))
+                    {
+                        return Ok(());
                     }
-                    callback_version.fetch_add(1, Ordering::Relaxed);
+                    // Quality-tier backdrop cap: at most one blit (and thus
+                    // one blur) per interval regardless of how fast frames
+                    // arrive — animations on a fast-changing desktop are
+                    // sampled at the cap, not at the monitor's frame rate.
+                    if host.capture_due() {
+                        let context = host.copy_context();
+                        unsafe {
+                            context.CopyResource(&stable, &texture);
+                        }
+                        callback_version.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Ok(())

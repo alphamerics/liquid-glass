@@ -37,8 +37,8 @@ cbuffer GlassParams : register(b1) {
     float turbulenceStrength;
     float turbulenceScale;
     float2 revealOrigin;
-    // Uniform shape scale anchored to the surface's bottom-center (1 = full
-    // size); the auto-hide reveal scales the pill in from ~85%.
+    // Uniform scale of the glass shape, anchored to its bottom-center
+    // (1 = full size); the auto-hide reveal scales the pill in from ~85%.
     float pillScale;
     // Anisotropic squash/stretch factors per axis on top of pillScale
     // (1.0 = undistorted); the taskbar's resize spring drives these.
@@ -149,6 +149,13 @@ float fbm(float2 p) {
     return sum;
 }
 
+// The lite tier's single-octave turbulence: one value-noise evaluation
+// instead of three. The reveal is a sub-second transient; the reduced
+// octave count is invisible inside the wobble.
+float fbmLite(float2 p) {
+    return valueNoise(p) * 0.9;
+}
+
 // Rounded-rect signed distance for a point in capsule space.
 float roundedRectSd(float2 position, float aspect, float radius) {
     const float2 bounds = float2(aspect * 0.5 - radius, 0.5 - radius);
@@ -172,7 +179,18 @@ float2 roundedRectNormal(float2 position, float aspect, float radius) {
     return float2(0.0, sign(position.y));
 }
 
-float4 ps_main(VertexOutput input) : SV_Target {
+// The composite body, shared by both shader variants. `lite` is a literal
+// at each entry point, so the compiler inlines and folds it: ps_main keeps
+// the full effect set, ps_main_lite drops to one noise octave, a single
+// satellite bubble and one dispersion tap (the Efficiency tier).
+//
+// The reveal-only work (fbm lobes, blob + satellite SDFs, the traveling
+// ripple) is guarded by a UNIFORM branch on the reveal energy: once the
+// glass has fully opened the branch never runs, so a settled surface —
+// and every content-driven frame over a static open panel — costs pure
+// SDF + tint + rim math. Previously the noise evaluations executed per
+// pixel on every present even with their result multiplied by zero.
+float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // Capture-texel units: all displacement math stays in the capture's own
     // uv space and is mapped into the crop only at the final sample.
     const float2 texel = captureTexelUv;
@@ -216,42 +234,73 @@ float4 ps_main(VertexOutput input) : SV_Target {
     // ramps the glass alpha instead (a plain dissolve, no bubble).
     const float shapeEased = lerp(eased, 1.0, glassFade);
     const float revealAlpha = lerp(1.0, eased, glassFade);
-    const float2 revealOriginPx = float2(
-        (revealOrigin.x - 0.5) * aspect,
-        revealOrigin.y - 0.5
-    );
-    const float2 revealRelative = scaledPosition - revealOriginPx;
-    const float revealDistance = length(revealRelative);
-    // Rim turbulence, sampled in screen space (surface-normalized units) so
-    // the growing boundary sweeps through a fixed noise field.
-    const float turbulenceFrequency = turbulenceScale * 3.5;
-    const float lobeAmplitude =
-        (turbulenceStrength / surfaceHeightPx) * revealEnergy * 0.8;
-    const float lobe = (fbm(
-        scaledPosition * turbulenceFrequency * 1.7
-        + float2(animationTime * 1.1, animationTime * 0.7)) - 0.5) * lobeAmplitude;
-    // Expanding blob: a liquid mass surging out of the origin, slightly
-    // off-axis so the growth reads as a surge rather than a balloon.
-    const float blobRadius = (0.30 + 0.14 * fbm(float2(animationTime * 0.9, 4.2)))
-        * smoothstep(0.0, 0.55, eased);
-    const float2 blobCenter = revealOriginPx
-        + normalize(revealRelative + 1e-5) * blobRadius * 0.25;
-    const float blobSd = length(scaledPosition - blobCenter) - blobRadius - lobe;
-    // Satellite bubbles: each inflates on a staggered slice of the timeline
-    // (the sine window grows it, then pops it), drifting outward from the
-    // origin in a pseudo-random direction before merging into the shape.
+    // Reveal-only state: exactly what the guarded block contributes, and
+    // the identity the settled state reduces to when the block never runs.
+    float lobe = 0.0;
+    float blobSd = 1e3;
     float bubblesSd = 1e3;
-    [unroll]
-    for (int bubble = 0; bubble < 3; bubble++) {
-        const float seed = float(bubble) * 2.7 + 1.0;
-        const float local = saturate((eased - 0.08 - float(bubble) * 0.16) / 0.45);
-        const float arc = sin(3.14159265 * local);
-        const float angle = hash21(float2(seed, 3.7)) * 6.2831853;
-        const float radius = (0.05 + 0.05 * hash21(float2(seed, 9.1))) * arc;
-        const float2 center = revealOriginPx
-            + float2(cos(angle), sin(angle))
-            * local * (0.16 + 0.14 * hash21(float2(seed, 5.3)));
-        bubblesSd = min(bubblesSd, length(scaledPosition - center) - radius);
+    float2 revealWarp = float2(0.0, 0.0);
+    if (revealEnergy > 0.0015) {
+        const float2 revealOriginPx = float2(
+            (revealOrigin.x - 0.5) * aspect,
+            revealOrigin.y - 0.5
+        );
+        const float2 revealRelative = scaledPosition - revealOriginPx;
+        const float revealDistance = length(revealRelative);
+        // Rim turbulence, sampled in screen space (surface-normalized units) so
+        // the growing boundary sweeps through a fixed noise field.
+        const float turbulenceFrequency = turbulenceScale * 3.5;
+        const float lobeAmplitude =
+            (turbulenceStrength / surfaceHeightPx) * revealEnergy * 0.8;
+        const float2 lobeUv = scaledPosition * turbulenceFrequency * 1.7
+            + float2(animationTime * 1.1, animationTime * 0.7);
+        lobe = ((lite ? fbmLite(lobeUv) : fbm(lobeUv)) - 0.5) * lobeAmplitude;
+        // Expanding blob: a liquid mass surging out of the origin, slightly
+        // off-axis so the growth reads as a surge rather than a balloon.
+        const float blobRadius = (0.30 + 0.14 * (lite
+                ? fbmLite(float2(animationTime * 0.9, 4.2))
+                : fbm(float2(animationTime * 0.9, 4.2))))
+            * smoothstep(0.0, 0.55, eased);
+        const float2 blobCenter = revealOriginPx
+            + normalize(revealRelative + 1e-5) * blobRadius * 0.25;
+        blobSd = length(scaledPosition - blobCenter) - blobRadius - lobe;
+        // Satellite bubbles: each inflates on a staggered slice of the
+        // timeline (the sine window grows it, then pops it), drifting
+        // outward from the origin in a pseudo-random direction before
+        // merging into the shape. The lite tier keeps one bubble.
+        const int bubbleCount = lite ? 1 : 3;
+        [unroll]
+        for (int bubble = 0; bubble < 3; bubble++) {
+            if (bubble >= bubbleCount) {
+                break;
+            }
+            const float seed = float(bubble) * 2.7 + 1.0;
+            const float local = saturate((eased - 0.08 - float(bubble) * 0.16) / 0.45);
+            const float arc = sin(3.14159265 * local);
+            const float angle = hash21(float2(seed, 3.7)) * 6.2831853;
+            const float radius = (0.05 + 0.05 * hash21(float2(seed, 9.1))) * arc;
+            const float2 center = revealOriginPx
+                + float2(cos(angle), sin(angle))
+                * local * (0.16 + 0.14 * hash21(float2(seed, 5.3)));
+            bubblesSd = min(bubblesSd, length(scaledPosition - center) - radius);
+        }
+        // Liquid content warp during the reveal: a traveling radial pulse
+        // emanating from the reveal origin (the captured content ripples
+        // outward like a droplet hitting water) plus domain-scrolled
+        // fractal shimmer, both fading out as the glass finishes opening.
+        revealWarp += normalize(revealRelative + 1e-5) * texel * revealWobble
+            * revealEnergy * sin(revealDistance * 34.0 - animationTime * 9.0) * 5.0;
+        // `lite` folds to a literal after inlining, so each entry point
+        // compiles exactly one of the two noise calls per site.
+        const float2 warpBase = baseUv * turbulenceScale * 12.0;
+        const float warpA = lite
+            ? fbmLite(warpBase + animationTime * 0.6)
+            : fbm(warpBase + animationTime * 0.6);
+        const float warpB = lite
+            ? fbmLite(warpBase + 11.3 - animationTime * 0.5)
+            : fbm(warpBase + 11.3 - animationTime * 0.5);
+        revealWarp += float2(warpA - 0.5, warpB - 0.5)
+            * texel * turbulenceStrength * revealEnergy;
     }
     // In fade mode the bubble and satellites are disabled entirely: their
     // distances are pushed beyond the surface so the intersection below
@@ -261,6 +310,10 @@ float4 ps_main(VertexOutput input) : SV_Target {
     // The uniformly scaled rounded rect the blob morphs into as the reveal
     // completes; its rim gets the same turbulence lobes.
     const float revealScale = max(shapeEased, 0.02);
+    const float2 revealOriginPx = float2(
+        (revealOrigin.x - 0.5) * aspect,
+        revealOrigin.y - 0.5
+    );
     const float2 revealedPosition =
         (scaledPosition - revealOriginPx) / revealScale + revealOriginPx;
     const float scaledSd = roundedRectSd(revealedPosition, aspect, capsuleRadius) - lobe;
@@ -289,26 +342,22 @@ float4 ps_main(VertexOutput input) : SV_Target {
     const float2 edgeNormal = roundedRectNormal(scaledPosition, aspect, capsuleRadius);
     float2 displacement = edgeNormal * texel * refractionStrength * edgeStrength;
     displacement += pointerVelocity * texel * pointerInfluence * edgeStrength;
-    // Liquid content warp during the reveal: a traveling radial pulse
-    // emanating from the reveal origin (the captured content ripples
-    // outward like a droplet hitting water) plus domain-scrolled fractal
-    // shimmer, both fading out as the glass finishes opening.
-    displacement += normalize(revealRelative + 1e-5) * texel * revealWobble
-        * revealEnergy * sin(revealDistance * 34.0 - animationTime * 9.0) * 5.0;
-    displacement += float2(
-        fbm(baseUv * turbulenceScale * 12.0 + animationTime * 0.6) - 0.5,
-        fbm(baseUv * turbulenceScale * 12.0 + 11.3 - animationTime * 0.5) - 0.5
-    ) * texel * turbulenceStrength * revealEnergy;
+    displacement += revealWarp;
     const float2 refractedUv = baseUv - displacement;
     // One tap into the pre-blurred Kawase backdrop — the heavy lifting (24
     // Vogel taps per pixel) now happens in the chain's low-resolution
     // passes; the composite only displaces, tints and masks.
     const float3 blurred = sampleBackdrop(refractedUv);
-    // Dispersion is intentionally almost imperceptible and exists only at the edge.
-    const float2 chromatic = edgeNormal * texel * edgeStrength * chromaticOffsetTexels;
-    const float red = sampleBackdrop(refractedUv - chromatic).r;
-    const float blue = sampleBackdrop(refractedUv + chromatic).b;
-    const float3 dispersed = lerp(blurred, float3(red, blurred.g, blue), edgeStrength * chromaticBlend);
+    // Dispersion is intentionally almost imperceptible and exists only at
+    // the edge. The lite tier skips the two extra taps entirely: two more
+    // backdrop samples per pixel saved on integrated GPUs.
+    float3 dispersed = blurred;
+    if (!lite) {
+        const float2 chromatic = edgeNormal * texel * edgeStrength * chromaticOffsetTexels;
+        const float red = sampleBackdrop(refractedUv - chromatic).r;
+        const float blue = sampleBackdrop(refractedUv + chromatic).b;
+        dispersed = lerp(blurred, float3(red, blurred.g, blue), edgeStrength * chromaticBlend);
+    }
     // ---- Adaptive Luminance-Aware Blend (vibrancy) ----
     // A uniform tint ignores what is behind the glass: a bright window washes
     // the glass out and a dark one turns it into a flat black block. Instead,
@@ -409,4 +458,15 @@ float4 ps_main(VertexOutput input) : SV_Target {
     // color. The composition swap chain expects premultiplied alpha, so the
     // color is scaled by the capsule coverage for smooth antialiased edges.
     return float4(saturate(shaded) * pillMask, pillMask);
+}
+
+float4 ps_main(VertexOutput input) : SV_Target {
+    return compositeImpl(input, false);
+}
+
+// The Efficiency tier's composite: identical structure, one noise octave,
+// one satellite bubble, one backdrop tap. Compiled alongside ps_main (the
+// process-wide shader cache makes the extra compile a one-time cost).
+float4 ps_main_lite(VertexOutput input) : SV_Target {
+    return compositeImpl(input, true);
 }

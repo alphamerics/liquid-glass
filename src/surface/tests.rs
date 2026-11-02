@@ -10,6 +10,10 @@ use windows::Win32::Foundation::RECT;
 fn liquid_composition_hlsl_compiles_for_d3d11() {
     compile_shader("vs_main", "vs_5_0").expect("D3D11 liquid vertex shader should compile");
     compile_shader("ps_main", "ps_5_0").expect("D3D11 liquid pixel shader should compile");
+    // The Efficiency tier's lite variant: both entries live in the same
+    // source, so a syntax error in either fails here at build time.
+    compile_shader("ps_main_lite", "ps_5_0")
+        .expect("D3D11 lite liquid pixel shader should compile");
 }
 
 #[test]

@@ -34,13 +34,30 @@ use windows::Win32::Graphics::{
         D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
         D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
     },
+    Dxgi::{
+        DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    },
 };
 use windows::Graphics::SizeInt32;
 
 use crate::broker::client::BrokerClient;
 use crate::capture::{CaptureFeed, FrameHost};
 use crate::params::GlassShaderParams;
+use crate::quality::{detect_gpu_class, fullscreen_foreground, resolve, GpuClass, QualityCaps};
 use crate::surface::{create_d3d11_device, SharedCompositor};
+
+/// Whether the D3D11 device is gone (driver reset/TDR). All GPU work fails
+/// after this; continuing to submit would crash-loop the driver instead of
+/// letting it recover.
+fn device_lost(device: &ID3D11Device) -> bool {
+    match unsafe { device.GetDeviceRemovedReason() } {
+        Ok(()) => false,
+        Err(error) => matches!(
+            error.code(),
+            DXGI_ERROR_DEVICE_REMOVED | DXGI_ERROR_DEVICE_RESET | DXGI_ERROR_DEVICE_HUNG
+        ),
+    }
+}
 
 /// The capture pool size multiplier. WGC renders content into the pool at
 /// native scale (a smaller pool CROPS and zooms, it does not downscale), so
@@ -53,6 +70,17 @@ pub(crate) const CAPTURE_SCALE: f32 = 1.0;
 /// edits land within this delay; the stat is one syscall per interval, so
 /// this is cheap to keep aggressive.
 const MATERIAL_POLL: Duration = Duration::from_millis(250);
+
+/// Insurance against a misbehaving capture driver: with dirty-region skips
+/// active, the backdrop still force-refreshes at least this often.
+const FORCE_BACKDROP_SECS: f32 = 2.0;
+
+/// How often the render loop re-checks the fullscreen-foreground state that
+/// throttles the backdrop rate under games/presentations.
+const FULLSCREEN_POLL: Duration = Duration::from_millis(500);
+
+/// How often the render loop re-checks the battery state (Auto tiers only).
+const POWER_POLL: Duration = Duration::from_secs(10);
 
 /// The shared material watch: polls the broker-owned material file's mtime
 /// on a bounded cadence and, on change, pushes the material onto every
@@ -89,10 +117,14 @@ impl MaterialWatch {
         }
         self.last_mtime = mtime;
         let material = crate::broker::read_material();
+        state.apply_quality(material.quality);
         for (_, compositor) in &state.surfaces {
             let Ok(mut compositor) = compositor.lock() else {
                 continue;
             };
+            // The lite composite shader follows the tier; flipping it is
+            // idempotent per compositor (the flag is compared before use).
+            compositor.set_lite_shader(state.quality.lite_shader);
             // Pinned surfaces derive their params from the material with
             // app-side rules; the app re-applies the material itself.
             if compositor.material_locked() {
@@ -138,6 +170,22 @@ pub(crate) struct EngineState {
     backdrop: Option<Backdrop>,
     backdrop_version: u64,
     backdrop_inputs: Option<BlurInputs>,
+    /// The resolved quality tier: the caps every backdrop build obeys.
+    quality: QualityCaps,
+    /// The material's quality mode (kept so power-state transitions can
+    /// re-resolve the tier).
+    quality_mode: crate::quality::QualityMode,
+    /// The GPU class the device runs on (tier resolution input).
+    gpu_class: GpuClass,
+    /// The backdrop rate cap currently in force (tier × fullscreen state);
+    /// the capture callback reads it through [`FrameHost::capture_due`].
+    backdrop_interval: Option<Duration>,
+    /// When the last capture blit ran (rate-cap bookkeeping).
+    last_copy: Option<Instant>,
+    /// When the backdrop last rebuilt (force-refresh cadence).
+    last_backdrop_build: Option<Instant>,
+    /// The last battery state seen by the tier resolution.
+    last_battery: Option<bool>,
 }
 
 impl EngineState {
@@ -148,6 +196,15 @@ impl EngineState {
         frame: (ID3D11Texture2D, ID3D11ShaderResourceView),
     ) {
         (self.frame_texture, self.capture_view) = (Some(frame.0), Some(frame.1));
+    }
+
+    /// Resolves the tier from the material's quality mode on the current
+    /// hardware and battery state, applying it to engine-level state (the
+    /// per-surface lite-shader flag is pushed by the material watch).
+    pub(crate) fn apply_quality(&mut self, mode: crate::quality::QualityMode) {
+        self.quality_mode = mode;
+        self.quality = resolve(mode, self.gpu_class);
+        self.backdrop_interval = self.quality.backdrop_interval(false);
     }
 }
 
@@ -182,6 +239,19 @@ impl FrameHost for EngineState {
             compositor.lock().map(|compositor| !compositor.is_paused()).unwrap_or(true)
         })
     }
+
+    fn capture_due(&mut self) -> bool {
+        // The render loop owns `backdrop_interval` (it polls the fullscreen
+        // state); the capture callback only consults it against the last
+        // blit time. This keeps the shell query off the WGC worker thread.
+        let due = self.backdrop_interval.map_or(true, |interval| {
+            self.last_copy.map_or(true, |last| last.elapsed() >= interval)
+        });
+        if due {
+            self.last_copy = Some(Instant::now());
+        }
+        due
+    }
 }
 
 pub(crate) struct SharedEngine {
@@ -199,8 +269,9 @@ pub(crate) fn engine() -> &'static SharedEngine {
     ENGINE.get_or_init(|| {
         let (device, context) =
             create_d3d11_device().expect("Glassbar shared glass device failed");
-        let state = Arc::new(Mutex::new(EngineState {
-            device,
+        let gpu_class = detect_gpu_class(&device);
+        let mut state = EngineState {
+            device: device.clone(),
             context,
             frame_texture: None,
             capture_view: None,
@@ -212,7 +283,18 @@ pub(crate) fn engine() -> &'static SharedEngine {
             backdrop: None,
             backdrop_version: 0,
             backdrop_inputs: None,
-        }));
+            quality: QualityCaps::HIGH,
+            quality_mode: crate::quality::QualityMode::Auto,
+            gpu_class,
+            backdrop_interval: None,
+            last_copy: None,
+            last_backdrop_build: None,
+            last_battery: None,
+        };
+        // The initial tier resolves from the material's mode (default auto)
+        // on this machine's GPU class and battery state.
+        state.apply_quality(crate::broker::read_material().quality);
+        let state = Arc::new(Mutex::new(state));
         let version = Arc::new(AtomicU64::new(0));
         let feed = Arc::new(Mutex::new(None));
         spawn_render_loop(
@@ -245,6 +327,9 @@ impl SharedEngine {
         // seeds them right after creation.
         let material = crate::broker::read_material();
         if let Ok(mut compositor) = compositor.lock() {
+            // A surface registered after the last material change still
+            // needs the tier's composite shader variant.
+            compositor.set_lite_shader(state.quality.lite_shader);
             if !compositor.material_locked() {
                 let mut merged = compositor.active_params();
                 material.apply_onto(&mut merged, CAPTURE_SCALE);
@@ -304,27 +389,35 @@ impl BlurInputs {
 
 /// Renders the shared backdrop once per tick when the capture has changed.
 /// With a static desktop (and during animations, which re-render only the
-/// composite) the previous backdrop is reused untouched.
-fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) {
+/// composite) the previous backdrop is reused untouched. Returns whether the
+/// blur failed (the caller checks for device loss on failure).
+fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool {
     let Some(capture) = state.capture_view.clone() else {
-        return;
+        return false;
     };
     let Some(inputs) = BlurInputs::collect(state) else {
         // Nothing is awake to consume a backdrop; keep the last one so a
         // surface resuming over a static desktop has material immediately.
-        return;
+        return false;
     };
+    // Insurance against drivers that report dirty regions inaccurately: if
+    // unchanged-frame skips somehow starve the backdrop, it still
+    // force-refreshes on this cadence (two seconds of worst-case lag).
+    let stale = state
+        .last_backdrop_build
+        .map_or(true, |last| last.elapsed().as_secs_f32() >= FORCE_BACKDROP_SECS);
     // Idle tick fast path: the backdrop already matches the newest capture
     // frame and the current material: the passes only run when one of those
     // moved (a settings change re-blurs even on a static desktop).
     if !force
+        && !stale
         && state.backdrop_version == version
         && state
             .backdrop_inputs
             .as_ref()
             .is_some_and(|last| *last == inputs)
     {
-        return;
+        return false;
     }
     let frame = [state.frame_size.Width.max(1) as u32, state.frame_size.Height.max(1) as u32];
     let blur = state.blur.get_or_insert_with(|| BlurEngine::new(&state.device));
@@ -333,13 +426,19 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) {
         &capture,
         frame,
         &inputs.params,
+        &state.quality,
     ) {
         Ok(backdrop) => {
             state.backdrop = Some(backdrop);
             state.backdrop_version = version;
             state.backdrop_inputs = Some(inputs);
+            state.last_backdrop_build = Some(Instant::now());
+            false
         }
-        Err(error) => eprintln!("Glassbar shared blur failed: {error}"),
+        Err(error) => {
+            eprintln!("Glassbar shared blur failed: {error}");
+            true
+        }
     }
 }
 
@@ -371,7 +470,19 @@ fn spawn_render_loop(
         // The shared material watch (see [`MaterialWatch`]): file changes
         // restyle every registered compositor within one poll cadence.
         let mut material = MaterialWatch::default();
-        while state
+        // Fullscreen foreground state (throttled shell query) that drops
+        // the backdrop rate to the tier's fullscreen cap.
+        let mut fullscreen = false;
+        let mut last_fullscreen_check: Option<Instant> = None;
+        // Battery transitions re-resolve the Auto tier (throttled query).
+        let mut last_power_check: Option<Instant> = None;
+        // The caps the current backdrop was built under: a tier change
+        // (settings edit or battery transition) must rebuild it.
+        let mut last_caps: Option<QualityCaps> = None;
+        // The interval already applied to the capture session (applied only
+        // on change, outside the state lock).
+        let mut applied_session_interval: Option<Duration> = None;
+        'main: while state
             .lock()
             .expect("shared glass lock poisoned")
             .render_running
@@ -383,6 +494,34 @@ fn spawn_render_loop(
             // The shared material may have changed on disk (a settings UI
             // in any glass app wrote it); push it onto the compositors.
             material.poll(&mut engine);
+
+            // Slow-cadence environment re-resolution: the fullscreen and
+            // power state gate the tier's backdrop rate; both shell calls
+            // are cheap but not free, and neither changes per frame.
+            let now = Instant::now();
+            if last_fullscreen_check
+                .map_or(true, |at| now.duration_since(at) >= FULLSCREEN_POLL)
+            {
+                last_fullscreen_check = Some(now);
+                fullscreen = fullscreen_foreground();
+            }
+            if last_power_check.map_or(true, |at| now.duration_since(at) >= POWER_POLL) {
+                last_power_check = Some(now);
+                let battery = crate::quality::on_battery();
+                if engine.last_battery != Some(battery) {
+                    engine.last_battery = Some(battery);
+                    let mode = engine.quality_mode;
+                    engine.apply_quality(mode);
+                    let lite = engine.quality.lite_shader;
+                    for (_, compositor) in &engine.surfaces {
+                        if let Ok(mut compositor) = compositor.lock() {
+                            compositor.set_lite_shader(lite);
+                        }
+                    }
+                }
+            }
+            engine.backdrop_interval = engine.quality.backdrop_interval(fullscreen);
+            let effective_interval = engine.backdrop_interval;
 
             // The awake-surface answer drives both pipelines: the broker's
             // slot flag and the local feed's lifecycle. A compositor whose
@@ -424,7 +563,21 @@ fn spawn_render_loop(
             // its output wholesale.
             if !broker_attached {
                 let first_backdrop = engine.backdrop.is_none();
-                refresh_backdrop(&mut engine, current, first_backdrop);
+                // A tier change (settings edit, battery transition) changes
+                // the chain caps: force one rebuild even without a fresh
+                // capture frame.
+                let tier_changed = last_caps.map_or(false, |caps| caps != engine.quality);
+                last_caps = Some(engine.quality);
+                let blur_failed =
+                    refresh_backdrop(&mut engine, current, first_backdrop || tier_changed);
+                if blur_failed && device_lost(&engine.device) {
+                    eprintln!(
+                        "Glassbar glass device removed (driver reset); \
+                         stopping the glass engine"
+                    );
+                    engine.render_running.store(false, Ordering::Relaxed);
+                    break 'main;
+                }
             }
             // What tells the compositors a FRESH backdrop arrived: the
             // capture's version in local mode, the broker's pull in
@@ -442,11 +595,38 @@ fn spawn_render_loop(
                             // appears (hosts gate reveals on `has_presented`);
                             // surfacing the error here is the only way to see it.
                             eprintln!("Glassbar surface render failed: {error}");
+                            // A driver reset (TDR) — common on saturated
+                            // integrated GPUs — fails every later call:
+                            // stopping the loop lets the driver recover
+                            // instead of crash-looping it. The glass freezes
+                            // on its last frame until the app restarts.
+                            if device_lost(&engine.device) {
+                                eprintln!(
+                                    "Glassbar glass device removed (driver reset); \
+                                     stopping the glass engine"
+                                );
+                                engine.render_running.store(false, Ordering::Relaxed);
+                                break 'main;
+                            }
                         }
                     }
                 }
             }
             drop(engine);
+            // The session-level rate cap (Windows 11 22H2+): WGC coalesces
+            // its frame deliveries to the interval, so the capture callback
+            // — and its full-monitor blit — never even run above the cap.
+            // Applied outside the state lock, only when the interval moved
+            // (tier change or fullscreen transition). Older systems ignore
+            // this and rely on the callback's `capture_due` gate.
+            if effective_interval != applied_session_interval {
+                applied_session_interval = effective_interval;
+                if let Some(active_feed) =
+                    feed.lock().expect("shared glass feed lock poisoned").as_ref()
+                {
+                    active_feed.set_min_update_interval(effective_interval);
+                }
+            }
             // Feed lifecycle, strictly outside the state lock: starting the
             // feed re-locks it, and dropping a feed while its own frame
             // callback blocks on that lock could deadlock the teardown.
@@ -525,7 +705,7 @@ pub(crate) struct BlurPlan {
 /// base` model, lands exactly on the previous band's end. Adding a level
 /// therefore never snaps: the new level begins at nearly full resolution
 /// with tiny taps (a gentle addition) and grows gradually from there.
-pub(crate) fn blur_plan(params: &GlassShaderParams) -> BlurPlan {
+pub(crate) fn blur_plan_with_caps(params: &GlassShaderParams, caps: &QualityCaps) -> BlurPlan {
     let radius = params.blur_radius_texels;
     if radius < 0.5 {
         return BlurPlan {
@@ -554,7 +734,14 @@ pub(crate) fn blur_plan(params: &GlassShaderParams) -> BlurPlan {
     // the base-scale floor (0.9) to match the previous band's end.
     let offsets_start = if band_levels == 1 { 0.25 } else { 0.9 };
     let offset_scale = (offsets_start + (2.0 - offsets_start) * position).clamp(0.25, 2.0);
-    let base_scale = 1.0 - 0.1 * position;
+    // Quality tier: the chain runs at a reduced internal resolution (the
+    // composite upsamples it anyway — a blurred backdrop has no fine detail
+    // to lose). The reduction ramps in over radius 12..24 so a slider sweep
+    // never jumps when it engages, and small radii keep full resolution
+    // where resampling would be visible.
+    let ramp = ((radius - 12.0) / 12.0).clamp(0.0, 1.0);
+    let tier_scale = 1.0 - ramp * (1.0 - caps.blur_internal_scale);
+    let base_scale = ((1.0 - 0.1 * position) * tier_scale).clamp(0.25, 1.0);
     let levels = samples.min(band_levels + 1);
     BlurPlan {
         sharp: false,
@@ -708,8 +895,9 @@ impl BlurEngine {
         capture: &ID3D11ShaderResourceView,
         frame: [u32; 2],
         params: &GlassShaderParams,
+        caps: &QualityCaps,
     ) -> Result<Backdrop, String> {
-        let plan = blur_plan(params);
+        let plan = blur_plan_with_caps(params, caps);
         if plan.sharp {
             return Ok(Backdrop {
                 view: capture.clone(),
@@ -1090,35 +1278,38 @@ pub(crate) fn compile_shader_from(
 
 #[cfg(test)]
 mod tests {
-    use super::blur_plan;
+    use super::blur_plan_with_caps;
     use crate::params::GlassShaderParams;
+    use crate::quality::QualityCaps;
+
+    const HIGH: QualityCaps = QualityCaps::HIGH;
 
     #[test]
     fn blur_plan_scales_resolution_and_levels_with_radius() {
         let mut params = GlassShaderParams::default();
         // Blur off: sharp capture, no chain.
         params.blur_radius_texels = 0.0;
-        assert!(blur_plan(&params).sharp);
+        assert!(blur_plan_with_caps(&params, &HIGH).sharp);
         // Default-ish blur (8): a shallow chain at high resolution.
         params.blur_radius_texels = 8.0;
-        let plan = blur_plan(&params);
+        let plan = blur_plan_with_caps(&params, &HIGH);
         assert!(!plan.sharp);
         assert_eq!(plan.levels, 2);
         assert!(plan.base_scale > 0.9);
         // Level bands at 12 / 28 / 64 (one buffer per hop, plus the crop).
         params.blur_radius_texels = 16.0;
-        assert_eq!(blur_plan(&params).levels, 3);
+        assert_eq!(blur_plan_with_caps(&params, &HIGH).levels, 3);
         params.blur_radius_texels = 32.0;
-        assert_eq!(blur_plan(&params).levels, 4);
+        assert_eq!(blur_plan_with_caps(&params, &HIGH).levels, 4);
         // Subtle blur: still a shallow chain at ~full resolution.
         params.blur_radius_texels = 2.0;
-        let plan = blur_plan(&params);
+        let plan = blur_plan_with_caps(&params, &HIGH);
         assert_eq!(plan.levels, 2);
         assert!(plan.base_scale > 0.98);
         // Samples setting only ever caps levels, never raises them.
         params.blur_samples = 1.0;
         params.blur_radius_texels = 32.0;
-        assert_eq!(blur_plan(&params).levels, 1);
+        assert_eq!(blur_plan_with_caps(&params, &HIGH).levels, 1);
     }
 
     #[test]
@@ -1131,11 +1322,14 @@ mod tests {
         // level, and a smaller samples cap would truncate it.
         params.blur_samples = 5.0;
         let reach = |radius: f32| {
-            let plan = blur_plan(&{
-                let mut p = params;
-                p.blur_radius_texels = radius;
-                p
-            });
+            let plan = blur_plan_with_caps(
+                &{
+                    let mut p = params;
+                    p.blur_radius_texels = radius;
+                    p
+                },
+                &HIGH,
+            );
             plan.offset_scale * (1usize << plan.levels) as f32 * plan.base_scale
         };
         for boundary in [12.0_f32, 28.0, 64.0] {
@@ -1145,6 +1339,53 @@ mod tests {
             assert!(
                 jump < 0.1,
                 "reach jumped {before} -> {after} at the level boundary {boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn efficiency_caps_cut_internal_resolution() {
+        let mut params = GlassShaderParams::default();
+        params.blur_samples = 5.0;
+        params.blur_radius_texels = 32.0;
+        let plan = blur_plan_with_caps(&params, &QualityCaps::EFFICIENCY);
+        // The internal scale ramp is fully engaged at radius 24+.
+        assert!(plan.base_scale <= QualityCaps::EFFICIENCY.blur_internal_scale);
+        // Subtle blur (below the ramp) keeps full resolution even on the
+        // efficient tier: resampling would be visible there. (Radius 8
+        // sits in the first band whose own ramp reaches base 0.936.)
+        params.blur_radius_texels = 8.0;
+        let plan = blur_plan_with_caps(&params, &QualityCaps::EFFICIENCY);
+        assert!(plan.base_scale > 0.9);
+        // The level count is untouched by the tier (only the user's
+        // samples setting caps it).
+        params.blur_radius_texels = 32.0;
+        assert_eq!(blur_plan_with_caps(&params, &QualityCaps::EFFICIENCY).levels, 4);
+    }
+
+    #[test]
+    fn blur_plan_stays_continuous_under_tier_caps() {
+        use crate::quality::QualityCaps;
+        let mut params = GlassShaderParams::default();
+        params.blur_samples = 5.0;
+        let reach = |radius: f32| {
+            let plan = blur_plan_with_caps(
+                &{
+                    let mut p = params;
+                    p.blur_radius_texels = radius;
+                    p
+                },
+                &QualityCaps::EFFICIENCY,
+            );
+            plan.offset_scale * (1usize << plan.levels) as f32 * plan.base_scale
+        };
+        for boundary in [12.0_f32, 24.0, 28.0, 64.0] {
+            let before = reach(boundary - 0.01);
+            let after = reach(boundary + 0.01);
+            let jump = (after - before).abs() / before.abs().max(1e-4);
+            assert!(
+                jump < 0.1,
+                "efficiency reach jumped {before} -> {after} at {boundary}"
             );
         }
     }

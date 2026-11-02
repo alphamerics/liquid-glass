@@ -41,6 +41,7 @@
 mod borderless;
 pub mod params;
 pub mod broker;
+pub mod quality;
 mod shared;
 mod surface;
 pub mod thumbnail;
@@ -49,6 +50,7 @@ pub(crate) mod capture;
 
 pub use borderless::{configure_borderless_host, install_activation_subclass};
 pub use params::{GlassConfig, GlassShaderParams, Material, RevealAnimation, SurfaceAnchor};
+pub use quality::{QualityMode, QualityCaps};
 pub use surface::{
     translate_compositor, translate_surface_window, D3D11Compositor, GlassSurface,
     SharedCompositor,

@@ -73,6 +73,12 @@ pub struct D3D11Compositor {
     composition_visual: IDCompositionVisual,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
+    /// The tier's lite composite shader variant (fewer noise octaves,
+    /// single dispersion tap). Compiled once per process alongside the
+    /// full shader; selected per present by `lite_shader`.
+    pixel_shader_lite: ID3D11PixelShader,
+    /// Whether `present` uses the lite shader variant (quality tier).
+    lite_shader: bool,
     sampler: ID3D11SamplerState,
     source_rect: ID3D11Buffer,
     source_rect_constants: SourceRectConstants,
@@ -236,6 +242,19 @@ impl D3D11Compositor {
             )
         }
         .map_err(|error| format!("Could not create the D3D11 pixel shader: {error}"))?;
+        let pixel_shader = pixel_shader.expect("D3D11 pixel shader missing");
+        // The lite variant compiles alongside the full one (the shader
+        // cache makes the second compile cheap after the first surface).
+        let mut pixel_shader_lite = None;
+        unsafe {
+            device.CreatePixelShader(
+                &compiled_shader(LIQUID_COMPOSITION_HLSL, "ps_main_lite", "ps_5_0")?,
+                None,
+                Some(&mut pixel_shader_lite),
+            )
+        }
+        .map_err(|error| format!("Could not create the lite pixel shader: {error}"))?;
+        let pixel_shader_lite = pixel_shader_lite.expect("lite pixel shader missing");
         let sampler = create_linear_clamp_sampler(device);
         let source_rect_constants =
             source_rect_constants(surface_bounds, primary_monitor_bounds)?;
@@ -255,7 +274,9 @@ impl D3D11Compositor {
             composition_target,
             composition_visual,
             vertex_shader: vertex_shader.expect("D3D11 vertex shader missing"),
-            pixel_shader: pixel_shader.expect("D3D11 pixel shader missing"),
+            pixel_shader,
+            pixel_shader_lite,
+            lite_shader: false,
             sampler,
             source_rect,
             source_rect_constants,
@@ -349,7 +370,12 @@ impl D3D11Compositor {
             }]));
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.VSSetShader(&self.vertex_shader, None);
-            context.PSSetShader(&self.pixel_shader, None);
+            let pixel_shader = if self.lite_shader {
+                &self.pixel_shader_lite
+            } else {
+                &self.pixel_shader
+            };
+            context.PSSetShader(pixel_shader, None);
             context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             context.PSSetShaderResources(0, Some(&[Some(backdrop.view.clone())]));
             context.PSSetConstantBuffers(0, Some(&[Some(self.source_rect.clone())]));
@@ -429,6 +455,17 @@ impl D3D11Compositor {
     /// parked.
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// Switches the composite between the full and lite shader variants
+    /// (the quality tier's choice). Marks the surface dirty so the next
+    /// presentation tick renders one frame with the new variant.
+    pub(crate) fn set_lite_shader(&mut self, lite: bool) {
+        if self.lite_shader == lite {
+            return;
+        }
+        self.lite_shader = lite;
+        self.params_dirty = true;
     }
 
     /// The surface's current material params. All surfaces derive from the

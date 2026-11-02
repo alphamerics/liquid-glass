@@ -1,4 +1,5 @@
 //! All tunable values for the liquid glass material and surface sizing.
+use crate::quality::QualityMode;
 /// Shader floats uploaded to the pixel shader's `GlassParams` constant
 /// buffer (register b1). Every field maps 1:1 to a uniform in
 /// `liquid_composition.hlsl`.
@@ -194,6 +195,10 @@ impl Default for GlassShaderParams {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Material {
+    /// The performance tier preset ("auto" | "high" | "balanced" |
+    /// "efficiency"). Resolved against the machine's GPU class and battery
+    /// state by the engine; defaults to auto.
+    pub quality: QualityMode,
     /// Strength of the edge refraction offset, in texels.
     pub refraction_strength: f32,
     /// Gaussian blur sigma, in captured texels.
@@ -257,6 +262,7 @@ impl Material {
     /// are expected unscaled — full-resolution texel units).
     pub fn from_params(params: &GlassShaderParams) -> Self {
         Self {
+            quality: QualityMode::Auto,
             refraction_strength: params.refraction_strength,
             blur_radius: params.blur_radius_texels,
             blur_samples: params.blur_samples,
@@ -324,6 +330,11 @@ impl Material {
                 .unwrap_or(fallback)
         };
         Self {
+            quality: value
+                .get("quality")
+                .and_then(|value| value.as_str())
+                .map(QualityMode::parse)
+                .unwrap_or(defaults.quality),
             refraction_strength: number("refractionStrength", defaults.refraction_strength),
             blur_radius: number("blurRadius", defaults.blur_radius),
             blur_samples: number("blurSamples", defaults.blur_samples),
