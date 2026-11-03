@@ -123,8 +123,13 @@ float3 sampleBackdrop(float2 captureUv) {
     return glassBackdrop.Sample(linearClamp, backdropUv(captureUv)).rgb;
 }
 
+// Polynomial integer-style hash (Dave Hoskins' hash12): no transcendental
+// math, no large-magnitude products, so it holds its distribution on GPUs
+// whose sin() degrades past ~1e5 (the sin-based hash it replaced).
 float hash21(float2 p) {
-    return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
+    float3 p3 = frac(p.xyx * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
 }
 
 float valueNoise(float2 p) {
@@ -350,13 +355,17 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     const float3 blurred = sampleBackdrop(refractedUv);
     // Dispersion is intentionally almost imperceptible and exists only at
     // the edge. The lite tier skips the two extra taps entirely: two more
-    // backdrop samples per pixel saved on integrated GPUs.
+    // backdrop samples per pixel saved on integrated GPUs. The full tier
+    // still skips them where their contribution cannot move a single 8-bit
+    // output level (the interior, where edgeStrength has faded to zero):
+    // the branch is edge-band-shaped, so its divergence is coherent.
     float3 dispersed = blurred;
-    if (!lite) {
+    const float dispersionWeight = edgeStrength * chromaticBlend;
+    if (!lite && dispersionWeight > 0.004) {
         const float2 chromatic = edgeNormal * texel * edgeStrength * chromaticOffsetTexels;
         const float red = sampleBackdrop(refractedUv - chromatic).r;
         const float blue = sampleBackdrop(refractedUv + chromatic).b;
-        dispersed = lerp(blurred, float3(red, blurred.g, blue), edgeStrength * chromaticBlend);
+        dispersed = lerp(blurred, float3(red, blurred.g, blue), dispersionWeight);
     }
     // ---- Adaptive Luminance-Aware Blend (vibrancy) ----
     // A uniform tint ignores what is behind the glass: a bright window washes

@@ -292,7 +292,16 @@ pub(crate) fn refresh_local_backdrop(
     let blur = entry
         .blur
         .get_or_insert_with(|| BlurEngine::new(&state.device));
-    match blur.render(&context, &capture, frame, &inputs.params, &state.quality) {
+    match blur.render(
+        &context,
+        &capture,
+        frame,
+        // Local glass covers its host window's whole frame; the full-frame
+        // blur over the window capture is already small.
+        None,
+        &inputs.params,
+        &state.quality,
+    ) {
         Ok(backdrop) => {
             entry.backdrop = Some(backdrop);
             entry.backdrop_version = current_version;

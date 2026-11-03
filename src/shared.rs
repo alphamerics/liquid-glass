@@ -142,10 +142,15 @@ impl MaterialWatch {
 pub(crate) const KAWASE_HLSL: &str = include_str!("kawase.hlsl");
 
 /// What a composite pass samples: the shared blurred backdrop, or (blur
-/// off) the sharp capture itself.
+/// off) the sharp capture itself. `crop` records the capture region the
+/// backdrop was built over (identity for the full-frame sharp path and the
+/// broker's full-monitor publication): the composite's capture→backdrop
+/// uv mapping is stamped from it at present time, so a backdrop blurred
+/// over a sub-region of the capture stays aligned with the screen.
 #[derive(Clone)]
 pub(crate) struct Backdrop {
     pub(crate) view: ID3D11ShaderResourceView,
+    pub(crate) crop: CropConstants,
 }
 
 pub(crate) struct EngineState {
@@ -164,10 +169,11 @@ pub(crate) struct EngineState {
     pub surfaces: Vec<(u64, SharedCompositor, SurfaceRoute)>,
     pub next_surface_id: u64,
     pub render_running: Arc<AtomicBool>,
-    /// The engine-level blur: one dual-Kawase chain over the whole GLOBAL
-    /// capture, rendered once per fresh frame and sampled by every
-    /// Global-sourced surface's composite. `None` until the first blurred
-    /// frame is needed.
+    /// The engine-level blur: one dual-Kawase chain over the GLOBAL
+    /// capture's union-of-active-surfaces region (or the whole capture when
+    /// that cannot be placed), rendered once per fresh frame and sampled by
+    /// every Global-sourced surface's composite. `None` until the first
+    /// blurred frame is needed.
     blur: Option<BlurEngine>,
     /// The last rendered GLOBAL backdrop, the capture version it was built
     /// from and the material params it was built for; reused by every
@@ -175,6 +181,11 @@ pub(crate) struct EngineState {
     backdrop: Option<Backdrop>,
     backdrop_version: u64,
     backdrop_inputs: Option<BlurInputs>,
+    /// The capture-pixel rect (x0, y0, x1, y1) the last GLOBAL backdrop was
+    /// blurred over (`None` = the full frame). A change forces one rebuild:
+    /// the crop is the union of the awake surfaces' regions, and a surface
+    /// must never sample a backdrop whose region no longer contains it.
+    backdrop_crop: Option<[u32; 4]>,
     /// The resolved quality tier: the caps every backdrop build obeys.
     pub(crate) quality: QualityCaps,
     /// The material's quality mode (kept so power-state transitions can
@@ -301,6 +312,7 @@ pub(crate) fn engine() -> &'static SharedEngine {
             backdrop: None,
             backdrop_version: 0,
             backdrop_inputs: None,
+            backdrop_crop: None,
             quality: QualityCaps::HIGH,
             quality_mode: crate::quality::QualityMode::Auto,
             gpu_class,
@@ -471,6 +483,90 @@ impl BlurInputs {
     }
 }
 
+/// The maximum sample displacement the composite can apply beyond a
+/// surface's bounds, in capture texels: edge refraction, chromatic
+/// dispersion, the pointer-driven bend (its velocity input is clamped to
+/// ±36 screen px), the reveal turbulence and wobble, plus a small constant
+/// so bilinear interpolation at the crop's rim always has real texels.
+fn displacement_reach_texels(params: &GlassShaderParams) -> f32 {
+    params.refraction_strength
+        + params.chromatic_offset_texels
+        + params.turbulence_strength
+        + params.reveal_wobble * 5.0
+        + params.pointer_influence * 36.0
+        + 8.0
+}
+
+/// Rounds a pixel rect outward to a multiple of `grid` px, clamped into the
+/// frame. Rounding keeps small surface moves from churning Kawase chain
+/// rebuilds (whose textures are sized to the crop) at the cost of a few
+/// dozen wasted texel rows.
+fn grid_aligned_crop(rect: [f32; 4], frame: [u32; 2], grid: f32) -> Option<[u32; 4]> {
+    let width = frame[0].max(1) as f32;
+    let height = frame[1].max(1) as f32;
+    let floor = |value: f32| (value / grid).floor() * grid;
+    let ceil = |value: f32| (value / grid).ceil() * grid;
+    let x0 = floor(rect[0].max(0.0)).clamp(0.0, width);
+    let y0 = floor(rect[1].max(0.0)).clamp(0.0, height);
+    let x1 = ceil(rect[2].min(width)).max(x0).min(width);
+    let y1 = ceil(rect[3].min(height)).max(y0).min(height);
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+        return None;
+    }
+    Some([x0 as u32, y0 as u32, x1 as u32, y1 as u32])
+}
+
+/// The region of the capture the shared GLOBAL chain should blur: the union
+/// of the awake Global surfaces' sampling rects grown by the composite's
+/// displacement reach, rounded to a 64 px grid. A taskbar pinned to one
+/// monitor edge turns the whole-monitor blur into a thin-strip blur.
+/// `None` = the full frame (also the fallback when an awake Global
+/// surface's sampling rect cannot be placed in monitor space).
+fn backdrop_crop_rect(
+    state: &EngineState,
+    frame: [u32; 2],
+    params: &GlassShaderParams,
+) -> Option<[u32; 4]> {
+    let mut union: Option<[f32; 4]> = None;
+    for (_, compositor, route) in &state.surfaces {
+        if route.source != BackdropSource::Global {
+            continue;
+        }
+        let Ok(compositor) = compositor.lock() else {
+            continue;
+        };
+        if compositor.is_paused() {
+            continue;
+        }
+        let Some(rect) = compositor.monitor_uv_rect() else {
+            return None;
+        };
+        union = Some(match union {
+            None => rect,
+            Some(current) => [
+                current[0].min(rect[0]),
+                current[1].min(rect[1]),
+                current[2].max(rect[2]),
+                current[3].max(rect[3]),
+            ],
+        });
+    }
+    let union = union?;
+    let width = frame[0].max(1) as f32;
+    let height = frame[1].max(1) as f32;
+    let reach = displacement_reach_texels(params);
+    grid_aligned_crop(
+        [
+            union[0] * width - reach,
+            union[1] * height - reach,
+            union[2] * width + reach,
+            union[3] * height + reach,
+        ],
+        frame,
+        64.0,
+    )
+}
+
 /// Renders the shared backdrop once per tick when the capture has changed.
 /// With a static desktop (and during animations, which re-render only the
 /// composite) the previous backdrop is reused untouched. Returns whether the
@@ -490,11 +586,22 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool 
     let stale = state.last_backdrop_build.map_or(true, |last| {
         last.elapsed().as_secs_f32() >= FORCE_BACKDROP_SECS
     });
+    // The blur only ever covers the awake surfaces' region (the union crop,
+    // None = the full frame); when the glass moves, the crop moves with it
+    // and the rebuild happens this tick rather than waiting for a fresh
+    // capture frame.
+    let frame = [
+        state.frame_size.Width.max(1) as u32,
+        state.frame_size.Height.max(1) as u32,
+    ];
+    let crop = backdrop_crop_rect(state, frame, &inputs.params);
+    let crop_changed = crop != state.backdrop_crop;
     // Idle tick fast path: the backdrop already matches the newest capture
     // frame and the current material: the passes only run when one of those
     // moved (a settings change re-blurs even on a static desktop).
     if !force
         && !stale
+        && !crop_changed
         && state.backdrop_version == version
         && state
             .backdrop_inputs
@@ -503,10 +610,7 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool 
     {
         return false;
     }
-    let frame = [
-        state.frame_size.Width.max(1) as u32,
-        state.frame_size.Height.max(1) as u32,
-    ];
+    state.backdrop_crop = crop;
     let blur = state
         .blur
         .get_or_insert_with(|| BlurEngine::new(&state.device));
@@ -514,6 +618,7 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool 
         &state.context,
         &capture,
         frame,
+        crop,
         &inputs.params,
         &state.quality,
     ) {
@@ -990,9 +1095,10 @@ pub(crate) struct BlurPlan {
     /// Kawase levels actually used (1..=5). Capped by the radius: the
     /// chain's own down/upsampling imposes a minimum blur per level, so a
     /// small radius must use fewer levels no matter the samples setting.
-    /// One more level than before the polish pass: the chain's shallowest
-    /// buffer now runs at base resolution, so each band needs one deeper
-    /// level to reach the same blur at the same slider position.
+    /// One more level than a pure-hop estimate: the chain's shallowest
+    /// buffer runs at base resolution (its hops are undone by the up side
+    /// there), so each band needs that extra level to reach the same blur
+    /// at the same slider position.
     pub(crate) levels: usize,
     /// Resolution of the chain's base (down0) level relative to the capture
     /// (0.9..1.0). Less blur hides less resampling, so lower radii run the
@@ -1061,10 +1167,12 @@ pub(crate) fn blur_plan_with_caps(params: &GlassShaderParams, caps: &QualityCaps
 }
 
 /// Mirrors the shader's `CropParams` constant buffer (register b2): the
-/// capture-uv geometry of the region the Kawase chain blurs, plus the
-/// capture texel size. The shared chain blurs the WHOLE capture, so the
-/// composite's backdrop uv equals the capture uv (identity crop); only the
-/// capture texel size carries information.
+/// capture-uv geometry of the region the Kawase chain blurred, plus the
+/// capture texel size. The composite maps a capture uv through
+/// `crop_origin_uv`/`crop_size_uv` into the backdrop's own uv space, so a
+/// backdrop blurred over a sub-region of the capture stays aligned with the
+/// screen. The sharp path and the broker's publication carry the identity
+/// crop (the backdrop covers the whole capture).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CropConstants {
@@ -1078,12 +1186,28 @@ pub(crate) struct CropConstants {
 }
 
 impl CropConstants {
-    /// The identity crop the composites bind for the shared full-capture
-    /// backdrop.
+    /// The identity crop: the backdrop covers the whole capture.
     pub(crate) fn identity(texel_uv: [f32; 2]) -> Self {
         Self {
             crop_origin_uv: [0.0, 0.0],
             crop_size_uv: [1.0, 1.0],
+            capture_texel_uv: texel_uv,
+            kawase_scale: 0.0,
+            padding: [0.0; 5],
+        }
+    }
+
+    /// The crop for a backdrop blurred over the capture's sub-rectangle
+    /// `px` (x0, y0, x1, y1 in capture pixels).
+    pub(crate) fn from_pixel_rect(px: [u32; 4], frame: [u32; 2], texel_uv: [f32; 2]) -> Self {
+        let width = frame[0].max(1) as f32;
+        let height = frame[1].max(1) as f32;
+        Self {
+            crop_origin_uv: [px[0] as f32 / width, px[1] as f32 / height],
+            crop_size_uv: [
+                (px[2] - px[0]) as f32 / width,
+                (px[3] - px[1]) as f32 / height,
+            ],
             capture_texel_uv: texel_uv,
             kawase_scale: 0.0,
             padding: [0.0; 5],
@@ -1100,21 +1224,20 @@ struct KawaseLevel {
     rtv: ID3D11RenderTargetView,
 }
 
-/// The intermediate buffers of the dual-Kawase blur over the whole capture.
-/// The down/up halves run at successively halved resolutions while the
-/// `polish` buffer holds the chain's final output at the full base
-/// resolution. Recreated whenever the frame size or the level count changes
-/// (monitor change, or params that move the level count).
+/// The intermediate buffers of the dual-Kawase blur over the (possibly
+/// cropped) capture. The down/up halves run at successively halved
+/// resolutions with the shallowest pair (down0/up0) at the full base
+/// resolution — the chain's output, which the composites sample directly.
+/// Recreated whenever the blurred region's size or the level count changes
+/// (monitor change, a moved surface union, or params that move the level
+/// count).
 struct KawaseChain {
-    /// Downsampling targets: down[i] is the capture at 1/2^i resolution.
+    /// Downsampling targets: down[i] is the source at 1/2^i resolution.
     down: Vec<KawaseLevel>,
     /// Upsampling targets: up[i] matches down[i]'s size; up[i] blends
     /// down[i+1] (deepest) or up[i+1] back toward down[i]'s resolution.
     up: Vec<KawaseLevel>,
-    /// The chain's final output: the shallowest level re-expanded to the
-    /// full `width` × `height` (base) resolution.
-    polish: KawaseLevel,
-    /// down0/up0/polish size in pixels: the capture scaled by the plan's
+    /// down0/up0 size in pixels: the blurred region scaled by the plan's
     /// base scale.
     width: u32,
     height: u32,
@@ -1197,30 +1320,44 @@ impl BlurEngine {
 
     /// Renders (or refreshes) the shared blurred backdrop for one capture
     /// frame. Cheap when nothing changed: the plan and the chain are
-    /// fingerprinted and the passes only run on change.
+    /// fingerprinted and the passes only run on change. `crop_px` (x0, y0,
+    /// x1, y1 in capture pixels, `None` = the full frame) restricts both the
+    /// chain's textures and its sampling to that region — a crop is a
+    /// region, not a scale, so tap offsets keep their capture-texel
+    /// semantics — and the returned backdrop carries the matching
+    /// `CropConstants`.
     pub(crate) fn render(
         &mut self,
         context: &ID3D11DeviceContext,
         capture: &ID3D11ShaderResourceView,
         frame: [u32; 2],
+        crop_px: Option<[u32; 4]>,
         params: &GlassShaderParams,
         caps: &QualityCaps,
     ) -> Result<Backdrop, String> {
+        let texel_uv = [1.0 / frame[0].max(1) as f32, 1.0 / frame[1].max(1) as f32];
         let plan = blur_plan_with_caps(params, caps);
         if plan.sharp {
             return Ok(Backdrop {
                 view: capture.clone(),
+                crop: CropConstants::identity(texel_uv),
             });
         }
-        let width = (frame[0] as f32 * plan.base_scale).ceil().max(1.0) as u32;
-        let height = (frame[1] as f32 * plan.base_scale).ceil().max(1.0) as u32;
-        let crop_current = CropConstants {
-            crop_origin_uv: [0.0, 0.0],
-            crop_size_uv: [1.0, 1.0],
-            capture_texel_uv: [1.0 / frame[0] as f32, 1.0 / frame[1] as f32],
-            kawase_scale: plan.offset_scale,
-            padding: [0.0; 5],
+        // The chain's base resolution scales the CROPPED region's pixel
+        // extent; a crop only discards texels the composites cannot sample
+        // (they were outside every surface's reach).
+        let crop_rect = match crop_px {
+            Some(px @ [x0, y0, x1, y1]) if x1 > x0 && y1 > y0 => Some(px),
+            _ => None,
         };
+        let region = crop_rect.map_or(frame, |[x0, y0, x1, y1]| [x1 - x0, y1 - y0]);
+        let width = (region[0] as f32 * plan.base_scale).ceil().max(1.0) as u32;
+        let height = (region[1] as f32 * plan.base_scale).ceil().max(1.0) as u32;
+        let mut crop_current = crop_rect.map_or_else(
+            || CropConstants::identity(texel_uv),
+            |px| CropConstants::from_pixel_rect(px, frame, texel_uv),
+        );
+        crop_current.kawase_scale = plan.offset_scale;
         if crop_current != self.crop_current {
             unsafe {
                 context.UpdateSubresource(
@@ -1263,9 +1400,10 @@ impl BlurEngine {
                 }
             }
             // Up side: expand from the deepest level back to down0's
-            // resolution; the final polish pass then re-expands to the
-            // chain's base resolution so the composite never sees a
-            // half-resolution backdrop.
+            // resolution. down0/up0 run at the chain's full base
+            // resolution, so the chain's output is up0 — the composites
+            // sample it directly, and a single-level chain (no up passes)
+            // hands them down0 instead.
             for level in (0..chain.up.len()).rev() {
                 let source = if level + 1 == chain.up.len() {
                     &chain.down[chain.levels - 1].srv
@@ -1282,22 +1420,15 @@ impl BlurEngine {
                     height,
                 );
             }
-            let shallow = match chain.up.first() {
-                Some(shallowest) => &shallowest.srv,
-                // A single level has no up passes; down0 is the source.
-                None => &chain.down[0].srv,
-            };
-            draw_kawase_pass(
-                context,
-                &self.up_shader,
-                &chain.polish,
-                shallow,
-                chain.width,
-                chain.height,
-            );
         }
+        let view = match chain.up.first() {
+            Some(shallowest) => &shallowest.srv,
+            // A single level has no up passes; down0 is the output.
+            None => &chain.down[0].srv,
+        };
         Ok(Backdrop {
-            view: chain.polish.srv.clone(),
+            view: view.clone(),
+            crop: crop_current,
         })
     }
 
@@ -1433,9 +1564,10 @@ fn build_kawase_chain(
     height: u32,
     levels: usize,
 ) -> Result<KawaseChain, String> {
-    // down[i] is the capture at 1/2^i; up[i] re-expands back to down[i]'s
-    // size, sourced from down[i+1] (the first up) or up[i+1]. `polish`
-    // re-expands the shallowest level to the full base resolution.
+    // down[i] is the source at 1/2^i; up[i] re-expands back to down[i]'s
+    // size, sourced from down[i+1] (the first up) or up[i+1]. down0/up0 run
+    // at the full base resolution, so the chain's output is up0 (down0 for
+    // a single level) and no separate finishing pass is needed.
     let mut down = Vec::with_capacity(levels);
     let mut up = Vec::with_capacity(levels.saturating_sub(1));
     for level in 0..levels {
@@ -1454,11 +1586,9 @@ fn build_kawase_chain(
             height.div_ceil(1u32 << shift),
         )?);
     }
-    let polish = create_kawase_level(device, width, height)?;
     Ok(KawaseChain {
         down,
         up,
-        polish,
         width,
         height,
         levels,
@@ -1578,7 +1708,7 @@ pub(crate) fn compile_shader_from(
 
 #[cfg(test)]
 mod tests {
-    use super::blur_plan_with_caps;
+    use super::{blur_plan_with_caps, grid_aligned_crop, CropConstants};
     use crate::params::GlassShaderParams;
     use crate::quality::QualityCaps;
 
@@ -1691,5 +1821,65 @@ mod tests {
                 "efficiency reach jumped {before} -> {after} at {boundary}"
             );
         }
+    }
+
+    #[test]
+    fn grid_aligned_crop_rounds_outward_and_clamps() {
+        // A rect strictly inside the frame grows to the 64 px grid in both
+        // directions: the rounded rect must CONTAIN the input.
+        let frame = [1920, 1080];
+        let rect = grid_aligned_crop([100.3, 200.6, 500.2, 700.9], frame, 64.0).expect("rect");
+        assert!(rect[0] <= 100 && rect[1] <= 200);
+        assert!(rect[2] >= 501 && rect[3] >= 701);
+        assert_eq!(rect[0] % 64, 0);
+        assert_eq!(rect[1] % 64, 0);
+        assert_eq!(rect[2] % 64, 0);
+        assert_eq!(rect[3] % 64, 0);
+        // Inputs inside the same grid cells snap to the same rect: small
+        // surface moves must not churn chain rebuilds.
+        let nudged = grid_aligned_crop([103.0, 205.0, 505.0, 704.0], frame, 64.0).expect("rect");
+        assert_eq!(rect, nudged);
+        // Rects reaching past the frame clamp into it.
+        let clamped = grid_aligned_crop([-50.0, -50.0, 5000.0, 5000.0], frame, 64.0)
+            .expect("rect");
+        assert_eq!(clamped, [0, 0, 1920, 1080]);
+        // Degenerate rects (past the frame edge, empty after clamping)
+        // fall back to no crop.
+        assert_eq!(
+            grid_aligned_crop([2000.0, 500.0, 2100.0, 600.0], frame, 64.0),
+            None
+        );
+    }
+
+    #[test]
+    fn crop_constants_map_capture_uvs_into_the_backdrop() {
+        let frame = [1920, 1080];
+        let texel = [1.0 / 1920.0, 1.0 / 1080.0];
+        // The identity crop maps every capture uv to itself.
+        let identity = CropConstants::identity(texel);
+        assert_eq!(
+            backdrop_uv_of(&identity, [0.25, 0.75]),
+            [0.25, 0.75]
+        );
+        // A sub-rect crop maps the region's corners to (0, 0) and (1, 1)
+        // and its center to (0.5, 0.5) — exactly what the composite's
+        // `backdropUv` does in the shader.
+        let rect = [640, 360, 1280, 720];
+        let crop = CropConstants::from_pixel_rect(rect, frame, texel);
+        let map = |uv: [f32; 2]| backdrop_uv_of(&crop, uv);
+        assert_eq!(map([rect[0] as f32 / 1920.0, rect[1] as f32 / 1080.0]), [0.0, 0.0]);
+        assert_eq!(map([rect[2] as f32 / 1920.0, rect[3] as f32 / 1080.0]), [1.0, 1.0]);
+        let center = map([960.0 / 1920.0, 540.0 / 1080.0]);
+        assert!((center[0] - 0.5).abs() < 1e-6 && (center[1] - 0.5).abs() < 1e-6);
+    }
+
+    /// The composite's capture→backdrop mapping (`backdropUv` in
+    /// liquid_composition.hlsl), mirrored here so the Rust-provided crop
+    /// constants are checked against the shader's exact math.
+    fn backdrop_uv_of(crop: &CropConstants, capture_uv: [f32; 2]) -> [f32; 2] {
+        [
+            (capture_uv[0] - crop.crop_origin_uv[0]) / crop.crop_size_uv[0],
+            (capture_uv[1] - crop.crop_origin_uv[1]) / crop.crop_size_uv[1],
+        ]
     }
 }

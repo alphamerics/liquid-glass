@@ -268,10 +268,10 @@ impl D3D11Compositor {
         let source_rect_constants = source_rect_constants(surface_bounds, backdrop_space)?;
         let source_rect = crate::shared::constant_buffer(device, &source_rect_constants)?;
         let glass_params = crate::shared::constant_buffer(device, &shader_params)?;
-        // The shared engine blurs the WHOLE capture, so the composite's
-        // backdrop uv equals the capture uv (identity crop); the buffer
-        // only carries the capture texel size and the sharp-backdrop flag,
-        // both refreshed by `present`/`resize`.
+        // The composite starts with the identity crop (backdrop = the whole
+        // capture); `present` re-stamps the buffer from the backdrop's own
+        // crop constants whenever the engine blurred a sub-region, and
+        // `resize` keeps the capture texel size fresh in between.
         let crop_constants_current =
             CropConstants::identity(source_rect_constants_texel(&backdrop_space));
         let crop_constants = crate::shared::constant_buffer(device, &crop_constants_current)?;
@@ -368,6 +368,22 @@ impl D3D11Compositor {
         self.update_pointer_velocity(context);
         self.update_reveal(context);
         let (_, target) = self.back_buffer_view(context)?;
+        // The backdrop carries the crop it was blurred over; the composite's
+        // capture→backdrop mapping must follow it (identity for the
+        // full-frame paths). Updated only on change, like the other buffers.
+        if self.crop_constants_current != backdrop.crop {
+            unsafe {
+                context.UpdateSubresource(
+                    &self.crop_constants,
+                    0,
+                    None,
+                    (&backdrop.crop as *const CropConstants).cast(),
+                    0,
+                    0,
+                );
+            }
+            self.crop_constants_current = backdrop.crop;
+        }
         unsafe {
             context.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
             context.RSSetViewports(Some(&[D3D11_VIEWPORT {
@@ -484,6 +500,26 @@ impl D3D11Compositor {
     /// across surfaces).
     pub(crate) fn active_params(&self) -> GlassShaderParams {
         self.glass_params_current
+    }
+
+    /// The surface's sampling rect in monitor space as uv (x0, y0, x1, y1),
+    /// for the shared GLOBAL blur's union crop: the engine blurs only the
+    /// region the awake Global surfaces actually sample. `None` while the
+    /// surface is parked, or when its samples hang in a space other than
+    /// the monitor (a Local feed's window frame) — the engine falls back to
+    /// the full-frame blur in the latter case.
+    pub(crate) fn monitor_uv_rect(&self) -> Option<[f32; 4]> {
+        if self.paused || !self.monitor_space {
+            return None;
+        }
+        let origin = self.source_rect_constants.source_uv_origin;
+        let size = self.source_rect_constants.source_uv_size;
+        Some([
+            origin[0],
+            origin[1],
+            origin[0] + size[0],
+            origin[1] + size[1],
+        ])
     }
 
     /// Whether the shared material watch must skip this surface (see the

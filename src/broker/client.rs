@@ -43,7 +43,7 @@ use super::protocol::{
     snapshot, ConsumerSlot, ManifestView, ATTACH_TIMEOUT, BROKER_EXE_NAME, CONSUMER_SLOTS,
     PROTOCOL_MAGIC, PROTOCOL_VERSION, SLOT_REQUESTED, SLOT_SUPPLIED, SLOT_UNUSED,
 };
-use crate::shared::Backdrop;
+use crate::shared::{Backdrop, CropConstants};
 
 /// The attach/presence poll cadence.
 const PRESENCE_POLL: Duration = Duration::from_millis(500);
@@ -420,7 +420,12 @@ impl BrokerClient {
         }
         self.last_version = version;
         Ok(Some(PulledFrame {
-            backdrop: Backdrop { view: private_view },
+            backdrop: Backdrop {
+                view: private_view,
+                // The broker publishes at the monitor's full resolution
+                // with no crop: the composite maps capture uv 1:1 onto it.
+                crop: CropConstants::identity([1.0 / width as f32, 1.0 / height as f32]),
+            },
         }))
     }
 

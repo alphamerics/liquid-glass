@@ -495,7 +495,10 @@ impl PublishEngine {
             host.frame_size.Width.max(1) as u32,
             host.frame_size.Height.max(1) as u32,
         ];
-        match self.blur.render(context, view, size, &self.params, caps) {
+        // Full-frame blur: the publication pass stretches the backdrop into
+        // the monitor-sized shared pair, so consumers' geometry must not
+        // depend on which region the chain covered.
+        match self.blur.render(context, view, size, None, &self.params, caps) {
             Ok(backdrop) => {
                 self.backdrop = Some(backdrop);
                 self.backdrop_version = host_version;

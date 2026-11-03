@@ -2,16 +2,17 @@
 //
 //   capture --ps_kawase_crop--> down0 (base crop) --ps_kawase_down--> down1
 //   (half) --ps_kawase_down--> down2 (quarter) --ps_kawase_up--> up1
-//   (half) --ps_kawase_up--> up0 (base) --ps_kawase_up--> polish (full
-//   base) --ps_stretch (publication)--> back buffer.
+//   (half) --ps_kawase_up--> up0 (base) --ps_stretch (publication)-->
+//   back buffer.
 //
 // Every pass touches 5 (down) or 8 (up) taps instead of the 27 the
 // composite used to spend per pixel on its Vogel-disk blur, and the taps run
 // at a fraction of the pixel count so the whole blur costs a fraction of one
-// full-resolution fill. The final polish pass re-expands the shallowest
-// chain level back to the base resolution: without it the composite's
-// backdrop would be the half-resolution up0 magnified 2x by a plain bilinear
-// stretch, which shows up as blocky, pixelated content behind the glass.
+// full-resolution fill. The chain's shallowest level (down0 and its matching
+// up0) already runs at the full base resolution, so the up side ends there:
+// a further same-resolution pass would re-tap the finished backdrop for no
+// visible change (the polish pass it used to feed was a bilinear identity at
+// the same size and has been removed).
 //
 
 Texture2D<float4> sourceTexture : register(t0);
