@@ -99,13 +99,17 @@ apps attach, and it exits when the session ends.
 
 ## Workspace members
 
-- `glass-demo/` — a minimal second liquid-glass consumer: a floating,
-  draggable glass panel that shares the session's broker with other glass
-  apps. Run it alongside Glassbar to see the sharing in action:
+- `glass-broker/` — the standalone broker bin crate (this workspace).
 
-  ```powershell
-  cargo run -p glass-demo
-  ```
+The runnable demo consumer lives in the top-level `glass-demo/` project of
+the workspace checkout (a Tauri app showing the global and local glass feeds
+with the web UI kit on top):
+
+```powershell
+cd ..\glass-demo
+.\install.ps1      # one-time dependency setup
+npm run tauri dev
+```
 
 ## Requirements
 

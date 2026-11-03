@@ -164,9 +164,9 @@ impl CaptureFeed {
         .map_err(|error| {
             format!("Could not create the Windows Graphics Capture frame pool: {error}")
         })?;
-        let session = frame_pool
-            .CreateCaptureSession(&item)
-            .map_err(|error| format!("Could not create the primary-monitor capture session: {error}"))?;
+        let session = frame_pool.CreateCaptureSession(&item).map_err(|error| {
+            format!("Could not create the primary-monitor capture session: {error}")
+        })?;
         // Windows 11: hide the yellow capture border (packaged capability
         // required; unpackaged builds ignore this).
         if let Err(error) = session.SetIsBorderRequired(false) {
@@ -341,7 +341,10 @@ pub(crate) fn create_frame_texture(
             .CreateShaderResourceView(&texture, None, Some(&mut view))
             .expect("Could not create the shared capture frame view");
     }
-    (texture, view.expect("D3D11 shared capture frame view missing"))
+    (
+        texture,
+        view.expect("D3D11 shared capture frame view missing"),
+    )
 }
 
 fn primary_monitor_item() -> Result<GraphicsCaptureItem, String> {
@@ -350,10 +353,9 @@ fn primary_monitor_item() -> Result<GraphicsCaptureItem, String> {
         return Err("Could not locate the primary monitor".to_owned());
     }
     let interop: IGraphicsCaptureItemInterop =
-        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-            .map_err(|error| {
-                format!("Could not obtain the GraphicsCaptureItem interop factory: {error}")
-            })?;
+        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(
+            |error| format!("Could not obtain the GraphicsCaptureItem interop factory: {error}"),
+        )?;
     unsafe {
         interop
             .CreateForMonitor(monitor)

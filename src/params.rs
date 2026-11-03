@@ -385,6 +385,51 @@ pub enum SurfaceAnchor {
     },
 }
 
+/// Which content a glass surface's backdrop samples. One drawer
+/// (the compositor) draws every surface the same way; the only decision a
+/// surface makes is which feed hands the drawer its backdrop:
+///
+/// - `Global`: the shared capture of the entire monitor. The glass
+///   refracts *everything* behind it — the desktop, other windows, all of
+///   it. This is the classic Glassbar look and costs one screen-duplication
+///   capture per session (shared, blurred once for every surface).
+///
+/// - `Local`: the host app's own window content, captured and blurred by
+///   itself. Glass that only ever sits over pixels the app already owns —
+///   an in-app container, gate, button, slider over a video pane — has no
+///   need to see the screen at all: with only Local surfaces the whole
+///   engine runs with **no monitor capture**.
+///
+/// The shader and the draw path are identical in both modes; only the
+/// backdrop's texture and the UV mapping change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackdropSource {
+    /// The shared full-monitor capture (requires screen duplication).
+    #[default]
+    Global,
+    /// A per-window capture of the app's own content.
+    Local,
+}
+
+/// Where the surface window sits relative to its host window.
+///
+/// - `BeneathHost` is the Glassbar overlay sandwich: the host is a
+///   transparent overlay window that renders the app's UI on top of the
+///   glass, and the surface stacks directly beneath it.
+/// - `AboveHost` covers the host window's own content with the glass —
+///   the layout of glass elements living inside a content app (glass over
+///   a video pane, a document, any native surface). Only this placement
+///   makes sense with [`BackdropSource::Local`]: the captured host window
+///   must stay visible beneath the glass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfacePlacement {
+    /// The surface stacks beneath the host overlay window (default).
+    #[default]
+    BeneathHost,
+    /// The surface stacks above the host window's content.
+    AboveHost,
+}
+
 /// Creation-time options for a [`crate::GlassSurface`].
 #[derive(Clone, Debug)]
 pub struct GlassConfig {
@@ -402,6 +447,17 @@ pub struct GlassConfig {
     /// Initial shader parameters; can be changed later with
     /// [`crate::GlassSurface::set_shader_params`].
     pub shader: GlassShaderParams,
+    /// Which feed hands this surface its backdrop (see [`BackdropSource`]).
+    pub backdrop_source: BackdropSource,
+    /// Where the surface window stacks relative to the host.
+    pub placement: SurfacePlacement,
+    /// Marks the surface window `WDA_EXCLUDEFROMCAPTURE` so it never
+    /// appears in any screen capture (preventing the Global feed from
+    /// refracting its own rendered pixels). Leave on for Global surfaces;
+    /// Local surfaces can turn this off — a per-window capture excludes
+    /// overlapping windows by itself, so screen recorders may keep the
+    /// glass visible in their output.
+    pub exclude_from_capture: bool,
 }
 
 impl Default for GlassConfig {
@@ -411,6 +467,9 @@ impl Default for GlassConfig {
             surface_anchor: SurfaceAnchor::default(),
             style_host_window: true,
             shader: GlassShaderParams::default(),
+            backdrop_source: BackdropSource::default(),
+            placement: SurfacePlacement::default(),
+            exclude_from_capture: true,
         }
     }
 }

@@ -30,19 +30,19 @@ use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::{
     Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
     Direct3D11::{
-        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-        ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-        ID3D11VertexShader, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
+        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+        ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
     },
     DirectComposition::{
         DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
     },
     Dxgi::{
         Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-        CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
-        DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-        DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
+        DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        DXGI_USAGE_RENDER_TARGET_OUTPUT,
     },
 };
 use windows::Win32::System::WinRT::{
@@ -214,7 +214,10 @@ impl ThumbnailSurface {
             Height: swap_chain_size[1],
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: BOOL(0),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
@@ -224,19 +227,18 @@ impl ThumbnailSurface {
             AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
             Flags: 0,
         };
-        let swap_chain = unsafe {
-            factory.CreateSwapChainForComposition(&device, &description, None)
+        let swap_chain =
+            unsafe { factory.CreateSwapChainForComposition(&device, &description, None) }
+                .map_err(|error| format!("Could not create the thumbnail swap chain: {error}"))?;
+        let composition_device: IDCompositionDevice = unsafe {
+            DCompositionCreateDevice(&dxgi_device)
         }
-        .map_err(|error| format!("Could not create the thumbnail swap chain: {error}"))?;
-        let composition_device: IDCompositionDevice =
-            unsafe { DCompositionCreateDevice(&dxgi_device) }
+        .map_err(|error| format!("Could not create the thumbnail composition device: {error}"))?;
+        let composition_target: IDCompositionTarget =
+            unsafe { composition_device.CreateTargetForHwnd(HWND(window as *mut _), BOOL(1)) }
                 .map_err(|error| {
-                    format!("Could not create the thumbnail composition device: {error}")
+                    format!("Could not create the thumbnail composition target: {error}")
                 })?;
-        let composition_target: IDCompositionTarget = unsafe {
-            composition_device.CreateTargetForHwnd(HWND(window as *mut _), BOOL(1))
-        }
-        .map_err(|error| format!("Could not create the thumbnail composition target: {error}"))?;
         let composition_visual: IDCompositionVisual = unsafe { composition_device.CreateVisual() }
             .map_err(|error| format!("Could not create the thumbnail visual: {error}"))?;
         unsafe {
@@ -269,9 +271,7 @@ impl ThumbnailSurface {
                     None,
                     Some(&mut pixel_shader),
                 )
-                .map_err(|error| {
-                    format!("Could not create the thumbnail pixel shader: {error}")
-                })?;
+                .map_err(|error| format!("Could not create the thumbnail pixel shader: {error}"))?;
         }
         let initial_constants = ThumbConstants {
             crop_origin_uv: [0.0; 2],
@@ -392,7 +392,13 @@ impl ThumbnailSurface {
         core.back_buffer = None;
         unsafe {
             core.swap_chain
-                .ResizeBuffers(0, size.0, size.1, DXGI_FORMAT_B8G8R8A8_UNORM, Default::default())
+                .ResizeBuffers(
+                    0,
+                    size.0,
+                    size.1,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    Default::default(),
+                )
                 .map_err(|error| format!("Could not resize the thumbnail swap chain: {error}"))?;
         }
         core.swap_chain_size = [size.0, size.1];
@@ -499,7 +505,8 @@ fn draw(core: &mut ThumbCore, view: ID3D11ShaderResourceView) -> Result<(), Stri
                 back_buffer,
                 target.expect("thumbnail render target missing"),
             );
-            core.context.ClearRenderTargetView(&pair.1, &[0.0, 0.0, 0.0, 0.0]);
+            core.context
+                .ClearRenderTargetView(&pair.1, &[0.0, 0.0, 0.0, 0.0]);
             core.back_buffer = Some(pair);
         }
         let (_, target) = core
@@ -569,13 +576,10 @@ fn start_capture(core: &Arc<Mutex<ThumbCore>>, target: isize) -> Result<Capture,
     // session can disable the yellow capture border (no-op unpackaged).
     request_borderless_capture();
 
-    let interop: IGraphicsCaptureItemInterop = windows::core::factory::<
-        GraphicsCaptureItem,
-        IGraphicsCaptureItemInterop,
-    >()
-    .map_err(|error| {
-        format!("Could not obtain the GraphicsCaptureItem interop factory: {error}")
-    })?;
+    let interop: IGraphicsCaptureItemInterop =
+        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(
+            |error| format!("Could not obtain the GraphicsCaptureItem interop factory: {error}"),
+        )?;
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(HWND(target as *mut _)) }
         .map_err(|error| format!("Could not capture the target window: {error}"))?;
     let size = item
@@ -583,7 +587,9 @@ fn start_capture(core: &Arc<Mutex<ThumbCore>>, target: isize) -> Result<Capture,
         .map_err(|error| format!("Could not read the target window size: {error}"))?;
 
     let winrt_device = {
-        let core = core.lock().map_err(|_| "thumbnail lock poisoned".to_owned())?;
+        let core = core
+            .lock()
+            .map_err(|_| "thumbnail lock poisoned".to_owned())?;
         AgileWinRTDevice(Arc::clone(&core.winrt_device.0))
     };
     let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -622,7 +628,9 @@ fn start_capture(core: &Arc<Mutex<ThumbCore>>, target: isize) -> Result<Capture,
 
     // Client-area inset measured once: a moving window keeps the same
     // frame-relative crop; a resizing one recomputes on the next retarget.
-    let mut core = core.lock().map_err(|_| "thumbnail lock poisoned".to_owned())?;
+    let mut core = core
+        .lock()
+        .map_err(|_| "thumbnail lock poisoned".to_owned())?;
     core.crop = client_crop_uv(target);
 
     Ok(Capture {
@@ -662,7 +670,7 @@ fn frame_arrived(
                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 FRAME_POOL_BUFFERS,
                 size,
-            ); 
+            );
             match create_frame_texture(&core.device, size) {
                 Ok((texture, view)) => {
                     core.frame_texture = Some(texture);
@@ -740,7 +748,10 @@ fn create_frame_texture(
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DEFAULT,
                 // It is sampled by the render loop and (deprecated) sized
                 // as a render target for the initial transparent clear.

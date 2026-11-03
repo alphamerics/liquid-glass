@@ -21,30 +21,32 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use windows::core::PCSTR;
+use windows::Graphics::SizeInt32;
 use windows::Win32::Graphics::{
     Direct3D::{
         Fxc::{D3DCompile, D3DCOMPILE_ENABLE_STRICTNESS},
         ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
     },
     Direct3D11::{
-        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-        ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-        ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET,
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC, D3D11_COMPARISON_ALWAYS,
-        D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
-        D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
+        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+        ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+        D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+        D3D11_BUFFER_DESC, D3D11_COMPARISON_ALWAYS, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+        D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
     },
-    Dxgi::{
-        DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
-    },
+    Dxgi::{DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET},
 };
-use windows::Graphics::SizeInt32;
 
+use crate::backdrop::{
+    local_backdrop, refresh_local_backdrop, start_local_feed, LocalFeedState, SurfaceRoute,
+};
 use crate::broker::client::BrokerClient;
 use crate::capture::{CaptureFeed, FrameHost};
-use crate::params::GlassShaderParams;
+use crate::params::{BackdropSource, GlassShaderParams};
 use crate::quality::{detect_gpu_class, fullscreen_foreground, resolve, GpuClass, QualityCaps};
 use crate::surface::{create_d3d11_device, SharedCompositor};
+use crate::window_capture::WindowCaptureFeed;
 
 /// Whether the D3D11 device is gone (driver reset/TDR). All GPU work fails
 /// after this; continuing to submit would crash-loop the driver instead of
@@ -118,7 +120,7 @@ impl MaterialWatch {
         self.last_mtime = mtime;
         let material = crate::broker::read_material();
         state.apply_quality(material.quality);
-        for (_, compositor) in &state.surfaces {
+        for (_, compositor, _route) in &state.surfaces {
             let Ok(mut compositor) = compositor.lock() else {
                 continue;
             };
@@ -149,52 +151,60 @@ pub(crate) struct Backdrop {
 pub(crate) struct EngineState {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
-    /// The newest captured frame, copied out of the WGC frame pool (whose
-    /// surfaces are recycled by the system) into a stable texture, plus the
-    /// shader view created alongside it.
+    /// The newest GLOBAL capture frame, copied out of the WGC frame pool
+    /// (whose surfaces are recycled by the system) into a stable texture,
+    /// plus the shader view created alongside it.
     pub frame_texture: Option<ID3D11Texture2D>,
     pub capture_view: Option<ID3D11ShaderResourceView>,
-    /// Current frame (and pool) size in pixels.
+    /// Current GLOBAL frame (and pool) size in pixels.
     pub frame_size: SizeInt32,
-    /// Registered surfaces: (id, compositor).
-    pub surfaces: Vec<(u64, SharedCompositor)>,
+    /// Registered surfaces: (id, compositor, backdrop route). The route
+    /// says which feed paints the surface: the GLOBAL monitor capture or a
+    /// LOCAL per-window feed.
+    pub surfaces: Vec<(u64, SharedCompositor, SurfaceRoute)>,
     pub next_surface_id: u64,
     pub render_running: Arc<AtomicBool>,
-    /// The engine-level blur: one dual-Kawase chain over the whole capture,
-    /// rendered once per fresh frame and sampled by every surface's
-    /// composite. `None` until the first blurred frame is needed.
+    /// The engine-level blur: one dual-Kawase chain over the whole GLOBAL
+    /// capture, rendered once per fresh frame and sampled by every
+    /// Global-sourced surface's composite. `None` until the first blurred
+    /// frame is needed.
     blur: Option<BlurEngine>,
-    /// The last rendered backdrop, the capture version it was built from
-    /// and the material params it was built for; reused by every
+    /// The last rendered GLOBAL backdrop, the capture version it was built
+    /// from and the material params it was built for; reused by every
     /// animation-driven frame in between.
     backdrop: Option<Backdrop>,
     backdrop_version: u64,
     backdrop_inputs: Option<BlurInputs>,
     /// The resolved quality tier: the caps every backdrop build obeys.
-    quality: QualityCaps,
+    pub(crate) quality: QualityCaps,
     /// The material's quality mode (kept so power-state transitions can
     /// re-resolve the tier).
     quality_mode: crate::quality::QualityMode,
     /// The GPU class the device runs on (tier resolution input).
     gpu_class: GpuClass,
     /// The backdrop rate cap currently in force (tier × fullscreen state);
-    /// the capture callback reads it through [`FrameHost::capture_due`].
-    backdrop_interval: Option<Duration>,
-    /// When the last capture blit ran (rate-cap bookkeeping).
+    /// the capture callbacks read it through the capture-due gates.
+    pub(crate) backdrop_interval: Option<Duration>,
+    /// When the last GLOBAL capture blit ran (rate-cap bookkeeping).
     last_copy: Option<Instant>,
-    /// When the backdrop last rebuilt (force-refresh cadence).
+    /// When the GLOBAL backdrop last rebuilt (force-refresh cadence).
     last_backdrop_build: Option<Instant>,
     /// The last battery state seen by the tier resolution.
     last_battery: Option<bool>,
+    /// The LOCAL feeds: one entry per captured app window (the pool of
+    /// windows with Local-sourced surfaces over them). Each entry carries
+    /// its own capture texture, its own small Kawase chain and its own
+    /// cached backdrop. `BackdropSource::Local` surfaces route here
+    /// through `backdrop::local_backdrop`; the GLOBAL feed above stays
+    /// untouched — an app with only Local surfaces never starts a monitor
+    /// capture at all.
+    pub(crate) local: HashMap<isize, LocalFeedState>,
 }
 
 impl EngineState {
     /// Replaces the shared capture frame and its view (called by the
     /// capture feed when a frame lands or the monitor's size changes).
-    pub(crate) fn set_frame(
-        &mut self,
-        frame: (ID3D11Texture2D, ID3D11ShaderResourceView),
-    ) {
+    pub(crate) fn set_frame(&mut self, frame: (ID3D11Texture2D, ID3D11ShaderResourceView)) {
         (self.frame_texture, self.capture_view) = (Some(frame.0), Some(frame.1));
     }
 
@@ -217,11 +227,7 @@ impl FrameHost for EngineState {
         self.context.clone()
     }
 
-    fn set_frame(
-        &mut self,
-        frame: (ID3D11Texture2D, ID3D11ShaderResourceView),
-        size: SizeInt32,
-    ) {
+    fn set_frame(&mut self, frame: (ID3D11Texture2D, ID3D11ShaderResourceView), size: SizeInt32) {
         self.frame_size = size;
         EngineState::set_frame(self, frame);
     }
@@ -235,8 +241,14 @@ impl FrameHost for EngineState {
     }
 
     fn any_active(&self) -> bool {
-        self.surfaces.iter().any(|(_, compositor)| {
-            compositor.lock().map(|compositor| !compositor.is_paused()).unwrap_or(true)
+        // Only the GLOBAL feed's consumers count: Local-only glass must
+        // not keep a monitor capture (or its blit) alive for nothing.
+        self.surfaces.iter().any(|(_, compositor, route)| {
+            route.source == BackdropSource::Global
+                && compositor
+                    .lock()
+                    .map(|compositor| !compositor.is_paused())
+                    .unwrap_or(true)
         })
     }
 
@@ -245,7 +257,8 @@ impl FrameHost for EngineState {
         // state); the capture callback only consults it against the last
         // blit time. This keeps the shell query off the WGC worker thread.
         let due = self.backdrop_interval.map_or(true, |interval| {
-            self.last_copy.map_or(true, |last| last.elapsed() >= interval)
+            self.last_copy
+                .map_or(true, |last| last.elapsed() >= interval)
         });
         if due {
             self.last_copy = Some(Instant::now());
@@ -256,19 +269,24 @@ impl FrameHost for EngineState {
 
 pub(crate) struct SharedEngine {
     pub state: Arc<Mutex<EngineState>>,
-    /// The single capture session, owned by the render loop (started with
-    /// the first awake surface, stopped when the last one unregisters — or
-    /// when every surface parks, so the OS capture pipeline idles with the
-    /// glass). Registration and teardown reach it through this handle.
+    /// The single GLOBAL capture session, owned by the render loop (started
+    /// with the first awake Global surface, stopped when the last one
+    /// unregisters — or when every one parks, so the OS capture pipeline
+    /// idles with the glass). Registration and teardown reach it through
+    /// this handle. A process with only Local surfaces never has one.
     feed: Arc<Mutex<Option<CaptureFeed>>>,
+    /// The LOCAL capture sessions, one per captured window, keyed by the
+    /// host HWND value. Also owned by the render loop; kept outside the
+    /// engine state so a session teardown (`Drop` → OS calls) never runs
+    /// while the engine mutex is held.
+    local_feeds: Arc<Mutex<HashMap<isize, WindowCaptureFeed>>>,
 }
 
 static ENGINE: OnceLock<SharedEngine> = OnceLock::new();
 
 pub(crate) fn engine() -> &'static SharedEngine {
     ENGINE.get_or_init(|| {
-        let (device, context) =
-            create_d3d11_device().expect("Glassbar shared glass device failed");
+        let (device, context) = create_d3d11_device().expect("Glassbar shared glass device failed");
         let gpu_class = detect_gpu_class(&device);
         let mut state = EngineState {
             device: device.clone(),
@@ -290,6 +308,7 @@ pub(crate) fn engine() -> &'static SharedEngine {
             last_copy: None,
             last_backdrop_build: None,
             last_battery: None,
+            local: HashMap::new(),
         };
         // The initial tier resolves from the material's mode (default auto)
         // on this machine's GPU class and battery state.
@@ -297,28 +316,46 @@ pub(crate) fn engine() -> &'static SharedEngine {
         let state = Arc::new(Mutex::new(state));
         let version = Arc::new(AtomicU64::new(0));
         let feed = Arc::new(Mutex::new(None));
+        let local_feeds = Arc::new(Mutex::new(HashMap::new()));
         spawn_render_loop(
             Arc::clone(&state),
             Arc::clone(&version),
             Arc::clone(&feed),
+            Arc::clone(&local_feeds),
         );
         SharedEngine {
             state,
             feed,
+            local_feeds,
         }
     })
 }
 
 impl SharedEngine {
-    /// Registers a surface's compositor. The capture itself is the render
-    /// loop's call: its very next tick sees the awake surface and starts
-    /// the feed (or attaches to the broker and skips a local feed
-    /// entirely) — one owner for the whole lifecycle.
-    pub(crate) fn register(&self, compositor: SharedCompositor) -> u64 {
+    /// Registers a surface's compositor together with its backdrop route
+    /// (which feed paints it, and for Local surfaces over which host
+    /// window). The captures themselves are the render loop's call: its
+    /// very next tick sees the awake surface and starts the feed (the
+    /// GLOBAL monitor capture or the LOCAL window capture — or attaches to
+    /// the broker, which replaces the global pipeline entirely). One owner
+    /// for the whole lifecycle.
+    pub(crate) fn register(&self, compositor: SharedCompositor, route: SurfaceRoute) -> u64 {
         let mut state = self.state.lock().expect("shared glass lock poisoned");
         let id = state.next_surface_id;
         state.next_surface_id += 1;
-        state.surfaces.push((id, Arc::clone(&compositor)));
+        state.surfaces.push((id, Arc::clone(&compositor), route));
+        // A Local surface's window needs its feed entry from now on (the
+        // render loop starts the capture for it); the entry persists after
+        // unregister until this call removes it again, so its cached
+        // backdrop survives brief park cycles.
+        if let Some(window) = route.window {
+            if matches!(route.source, crate::params::BackdropSource::Local) {
+                state
+                    .local
+                    .entry(window)
+                    .or_insert_with(LocalFeedState::new);
+            }
+        }
         // The fresh surface adopts the shared material: the merge starts
         // from what the caller configured (surface-specific fields like the
         // capsule radius survive), so a new glass window is styled
@@ -339,16 +376,50 @@ impl SharedEngine {
         id
     }
 
-    /// Unregisters a surface; stops the shared capture with the last one.
+    /// Unregisters a surface; stops the GLOBAL capture with the last
+    /// Global surface and tears down LOCAL feeds whose last consumer is
+    /// gone (their cached backdrops go with them — nothing can present
+    /// them anymore).
     pub(crate) fn unregister(&self, id: u64) {
-        let empty = {
+        let dropped_window_backdrops: Vec<isize>;
+        let global_empty = {
             let mut state = self.state.lock().expect("shared glass lock poisoned");
-            state.surfaces.retain(|(existing, _)| *existing != id);
-            state.surfaces.is_empty()
+            state.surfaces.retain(|(existing, _, _)| *existing != id);
+            dropped_window_backdrops = state
+                .local
+                .keys()
+                .copied()
+                .filter(|window| {
+                    !state
+                        .surfaces
+                        .iter()
+                        .any(|(_, _, route)| route.consumes_window(*window))
+                })
+                .collect();
+            for window in &dropped_window_backdrops {
+                state.local.remove(window);
+            }
+            !state
+                .surfaces
+                .iter()
+                .any(|(_, _, route)| route.source == BackdropSource::Global)
         };
-        if empty {
-            // No glass left anywhere: stop the capture entirely.
+        if global_empty {
+            // No global glass left: stop the monitor capture entirely (the
+            // broker client parks itself on its next tick — see the loop's
+            // route conditions).
             *self.feed.lock().expect("shared glass feed lock poisoned") = None;
+        }
+        // Session teardowns must never run under a lock the frame callbacks
+        // may be waiting on.
+        if !dropped_window_backdrops.is_empty() {
+            let mut feeds = self
+                .local_feeds
+                .lock()
+                .expect("shared glass local feed lock poisoned");
+            for window in dropped_window_backdrops {
+                feeds.remove(&window);
+            }
         }
     }
 
@@ -361,8 +432,8 @@ impl SharedEngine {
 /// One snapshot of what the blur needs from the live surfaces: the active
 /// (unpaused) surfaces' shared material params.
 #[derive(PartialEq)]
-struct BlurInputs {
-    params: GlassShaderParams,
+pub(crate) struct BlurInputs {
+    pub(crate) params: GlassShaderParams,
 }
 
 impl BlurInputs {
@@ -370,9 +441,22 @@ impl BlurInputs {
     /// material from the same saved settings, so the blur-relevant params
     /// (radius, samples) are identical across surfaces; the first active
     /// surface's copy is authoritative.
-    fn collect(state: &EngineState) -> Option<Self> {
+    pub(crate) fn collect(state: &EngineState) -> Option<Self> {
+        Self::collect_matching(state, |_| true)
+    }
+
+    /// Like [`BlurInputs::collect`], but only from the surfaces the given
+    /// route filter selects (the GLOBAL feed ignores Local surfaces and
+    /// each window's LOCAL feed only reads its own consumers).
+    pub(crate) fn collect_matching(
+        state: &EngineState,
+        select: impl Fn(&SurfaceRoute) -> bool,
+    ) -> Option<Self> {
         let mut params = None;
-        for (_, compositor) in &state.surfaces {
+        for (_, compositor, route) in &state.surfaces {
+            if !select(route) {
+                continue;
+            }
             let Ok(compositor) = compositor.lock() else {
                 continue;
             };
@@ -403,9 +487,9 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool 
     // Insurance against drivers that report dirty regions inaccurately: if
     // unchanged-frame skips somehow starve the backdrop, it still
     // force-refreshes on this cadence (two seconds of worst-case lag).
-    let stale = state
-        .last_backdrop_build
-        .map_or(true, |last| last.elapsed().as_secs_f32() >= FORCE_BACKDROP_SECS);
+    let stale = state.last_backdrop_build.map_or(true, |last| {
+        last.elapsed().as_secs_f32() >= FORCE_BACKDROP_SECS
+    });
     // Idle tick fast path: the backdrop already matches the newest capture
     // frame and the current material: the passes only run when one of those
     // moved (a settings change re-blurs even on a static desktop).
@@ -419,8 +503,13 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool 
     {
         return false;
     }
-    let frame = [state.frame_size.Width.max(1) as u32, state.frame_size.Height.max(1) as u32];
-    let blur = state.blur.get_or_insert_with(|| BlurEngine::new(&state.device));
+    let frame = [
+        state.frame_size.Width.max(1) as u32,
+        state.frame_size.Height.max(1) as u32,
+    ];
+    let blur = state
+        .blur
+        .get_or_insert_with(|| BlurEngine::new(&state.device));
     match blur.render(
         &state.context,
         &capture,
@@ -447,10 +536,69 @@ fn refresh_backdrop(state: &mut EngineState, version: u64, force: bool) -> bool 
 /// must not churn the capture session.
 const IDLE_FEED_TICKS: u32 = 120;
 
+/// Escalating restart backoff for a capture feed that keeps failing to
+/// start. The first failure waits one hysteresis window (~2s); every
+/// further consecutive failure quadruples the wait (capped at ~2 minutes),
+/// so a permanently rejected capture degrades into a quiet retry every
+/// couple of minutes instead of hammering the capture service — and
+/// flooding the log — every two seconds.
+struct RestartBackoff {
+    consecutive_failures: u32,
+    ticks: u32,
+}
+
+impl RestartBackoff {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            ticks: 0,
+        }
+    }
+
+    /// Whether a start attempt may run now; consumes one waited tick
+    /// otherwise (the loop's own cadence drives the countdown).
+    fn ready(&mut self) -> bool {
+        if self.ticks > 0 {
+            self.ticks -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn note_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.ticks = 0;
+    }
+
+    /// Records a failed start: escalates the wait and logs — the first
+    /// failure with the bare error, the second with the recovery posture
+    /// and the known refusal causes, further ones silently.
+    fn note_failure(&mut self, scope: &str, error: &str) {
+        self.consecutive_failures += 1;
+        let level = self.consecutive_failures.min(4);
+        self.ticks = IDLE_FEED_TICKS
+            .saturating_mul(1u32 << (2 * (level - 1)))
+            .min(IDLE_FEED_TICKS.saturating_mul(64));
+        match self.consecutive_failures {
+            1 => eprintln!("Glassbar {scope} failed to start: {error}"),
+            2 => eprintln!(
+                "Glassbar {scope} keeps failing to start ({error}); retrying at a slower \
+                 cadence. Window capture is refused for some hosts: windows hidden from \
+                 the taskbar (tauri's skipTaskbar calls ITaskbarList::DeleteTab), \
+                 WS_EX_NOACTIVATE / WS_EX_TOOLWINDOW windows, minimized windows, and \
+                 windows protected with SetWindowDisplayAffinity."
+            ),
+            _ => {}
+        }
+    }
+}
+
 fn spawn_render_loop(
     state: Arc<Mutex<EngineState>>,
     version: Arc<AtomicU64>,
     feed: Arc<Mutex<Option<CaptureFeed>>>,
+    local_feeds: Arc<Mutex<HashMap<isize, WindowCaptureFeed>>>,
 ) {
     std::thread::spawn(move || {
         // The feed's host view of the engine state: the capture pipeline
@@ -462,7 +610,7 @@ fn spawn_render_loop(
         // After a failed capture start, wait a full hysteresis window before
         // retrying so a persistent failure does not spam the session at the
         // loop's tick rate.
-        let mut restart_backoff = 0u32;
+        let mut restart_backoff = RestartBackoff::new();
         // The broker client machine (see `broker::client`): every tick
         // advances attach/pull; a silent failure falls back to the local
         // pipeline by returning an `Err` once and resetting to `Idle`.
@@ -482,6 +630,13 @@ fn spawn_render_loop(
         // The interval already applied to the capture session (applied only
         // on change, outside the state lock).
         let mut applied_session_interval: Option<Duration> = None;
+        // Per-LOCAL-window bookkeeping: the frame version still owed to
+        // surfaces (dispatched after each pass), the parked-idle counters
+        // and per-window start backoff.
+        let mut local_signal: HashMap<isize, u64> = HashMap::new();
+        let mut local_seen_version: HashMap<isize, u64> = HashMap::new();
+        let mut local_idle_ticks: HashMap<isize, u32> = HashMap::new();
+        let mut local_restarts: HashMap<isize, RestartBackoff> = HashMap::new();
         'main: while state
             .lock()
             .expect("shared glass lock poisoned")
@@ -499,9 +654,7 @@ fn spawn_render_loop(
             // power state gate the tier's backdrop rate; both shell calls
             // are cheap but not free, and neither changes per frame.
             let now = Instant::now();
-            if last_fullscreen_check
-                .map_or(true, |at| now.duration_since(at) >= FULLSCREEN_POLL)
-            {
+            if last_fullscreen_check.map_or(true, |at| now.duration_since(at) >= FULLSCREEN_POLL) {
                 last_fullscreen_check = Some(now);
                 fullscreen = fullscreen_foreground();
             }
@@ -513,7 +666,7 @@ fn spawn_render_loop(
                     let mode = engine.quality_mode;
                     engine.apply_quality(mode);
                     let lite = engine.quality.lite_shader;
-                    for (_, compositor) in &engine.surfaces {
+                    for (_, compositor, _route) in &engine.surfaces {
                         if let Ok(mut compositor) = compositor.lock() {
                             compositor.set_lite_shader(lite);
                         }
@@ -523,32 +676,47 @@ fn spawn_render_loop(
             engine.backdrop_interval = engine.quality.backdrop_interval(fullscreen);
             let effective_interval = engine.backdrop_interval;
 
-            // The awake-surface answer drives both pipelines: the broker's
-            // slot flag and the local feed's lifecycle. A compositor whose
-            // lock is poisoned counts as awake — a stuck lock must never
-            // park the glass.
-            let any_active = engine.surfaces.iter().any(|(_, compositor)| {
-                compositor.lock().map(|c| !c.is_paused()).unwrap_or(true)
+            // The awake-GLOBAL-surface answer drives the global pipelines:
+            // the broker's slot flag and the monitor feed's lifecycle.
+            // LOCAL feeds are gated per capturing window further down. A
+            // compositor whose lock is poisoned counts as awake — a stuck
+            // lock must never park the glass.
+            let any_global_active = engine.surfaces.iter().any(|(_, compositor, route)| {
+                route.source == BackdropSource::Global
+                    && compositor.lock().map(|c| !c.is_paused()).unwrap_or(true)
             });
+            // A tier change (settings edit, battery transition) changes the
+            // chain caps of EVERY feed: force one rebuild even without a
+            // fresh capture frame.
+            let tier_changed = last_caps.map_or(false, |caps| caps != engine.quality);
+            last_caps = Some(engine.quality);
 
             // Broker attempt first: when it hands over a fresh backdrop the
-            // local pipeline is skipped entirely this tick.
+            // global pipeline is skipped entirely this tick. Only Global
+            // consumers participate — the broker publishes the shared
+            // screen material, which Local glass must not adopt. A process
+            // with no Global surfaces (and no attachment yet) never starts
+            // the broker machine at all: a local-only app neither spawns
+            // nor contacts a broker.
             let mut frame_changed = false;
             let mut broker_attached = false;
-            match broker.tick(&engine.device, &engine.context, any_active) {
-                Ok(Some(frame)) => {
-                    engine.backdrop = Some(frame.backdrop);
-                    frame_changed = true;
-                    broker_attached = true;
-                }
-                Ok(None) => broker_attached = broker.attached(),
-                Err(error) => {
-                    eprintln!(
-                        "glass broker unavailable, running the in-process engine instead: {error}"
-                    );
-                    // Forget whatever the broker published: the local
-                    // pipeline must build the next backdrop fresh.
-                    engine.backdrop = None;
+            if any_global_active || broker.attached() {
+                match broker.tick(&engine.device, &engine.context, any_global_active) {
+                    Ok(Some(frame)) => {
+                        engine.backdrop = Some(frame.backdrop);
+                        frame_changed = true;
+                        broker_attached = true;
+                    }
+                    Ok(None) => broker_attached = broker.attached(),
+                    Err(error) => {
+                        eprintln!(
+                            "glass broker unavailable, running the in-process engine instead: \
+                             {error}"
+                        );
+                        // Forget whatever the broker published: the global
+                        // pipeline must build the next backdrop fresh.
+                        engine.backdrop = None;
+                    }
                 }
             }
 
@@ -559,15 +727,10 @@ fn spawn_render_loop(
             // per animation tick. The first tick after startup forces one
             // render even before a capture frame lands, so freshly spawned
             // surfaces composite from the very first frame. In broker mode
-            // the local chain never runs: the published backdrop replaces
+            // the global chain never runs: the published backdrop replaces
             // its output wholesale.
             if !broker_attached {
                 let first_backdrop = engine.backdrop.is_none();
-                // A tier change (settings edit, battery transition) changes
-                // the chain caps: force one rebuild even without a fresh
-                // capture frame.
-                let tier_changed = last_caps.map_or(false, |caps| caps != engine.quality);
-                last_caps = Some(engine.quality);
                 let blur_failed =
                     refresh_backdrop(&mut engine, current, first_backdrop || tier_changed);
                 if blur_failed && device_lost(&engine.device) {
@@ -579,97 +742,243 @@ fn spawn_render_loop(
                     break 'main;
                 }
             }
-            // What tells the compositors a FRESH backdrop arrived: the
-            // capture's version in local mode, the broker's pull in
-            // attached mode. Animations and dirty params still request
-            // frames through `wants_frame` regardless.
-            let present_signal = if broker_attached { frame_changed } else { version_changed };
-            for (_, compositor) in &engine.surfaces {
+
+            // Each LOCAL feed blurs its own window capture independently of
+            // the broker above; refreshes follow the same
+            // content-force/tier-force cadence. The window's present
+            // signal — a fresh frame surfaces have not seen yet — is
+            // snapshot per window and consumed by the dispatch below.
+            for window in engine.local.keys().copied().collect::<Vec<_>>() {
+                let first_backdrop = engine
+                    .local
+                    .get(&window)
+                    .map_or(false, |entry| entry.backdrop.is_none());
+                let blur_failed =
+                    refresh_local_backdrop(&mut engine, window, first_backdrop || tier_changed);
+                if blur_failed && device_lost(&engine.device) {
+                    eprintln!(
+                        "Glassbar glass device removed (driver reset); \
+                         stopping the glass engine"
+                    );
+                    engine.render_running.store(false, Ordering::Relaxed);
+                    break 'main;
+                }
+                let fresh_version = engine
+                    .local
+                    .get(&window)
+                    .map_or(0, |entry| entry.version.load(Ordering::Relaxed));
+                local_signal.insert(window, fresh_version);
+            }
+
+            // One drawer, routed by each surface's backdrop feed: a Global
+            // surface composites the shared monitor backdrop (driven by the
+            // monitor's frame version, or the broker's pull once attached),
+            // a Local surface its own window's backdrop (driven by that
+            // window's frame version). Animations and dirty params still
+            // request frames through `wants_frame` regardless.
+            for (_, compositor, route) in &engine.surfaces {
                 let Ok(mut compositor) = compositor.lock() else {
                     continue;
                 };
-                if compositor.wants_frame(present_signal) {
-                    if let Some(backdrop) = engine.backdrop.as_ref() {
-                        if let Err(error) = compositor.present(&engine.context, backdrop) {
-                            // A failed present means the surface silently never
-                            // appears (hosts gate reveals on `has_presented`);
-                            // surfacing the error here is the only way to see it.
-                            eprintln!("Glassbar surface render failed: {error}");
-                            // A driver reset (TDR) — common on saturated
-                            // integrated GPUs — fails every later call:
-                            // stopping the loop lets the driver recover
-                            // instead of crash-looping it. The glass freezes
-                            // on its last frame until the app restarts.
-                            if device_lost(&engine.device) {
-                                eprintln!(
-                                    "Glassbar glass device removed (driver reset); \
-                                     stopping the glass engine"
-                                );
-                                engine.render_running.store(false, Ordering::Relaxed);
-                                break 'main;
-                            }
+                let device_lost = match route.source {
+                    BackdropSource::Global => {
+                        let present_signal = if broker_attached {
+                            frame_changed
+                        } else {
+                            version_changed
+                        };
+                        if compositor.wants_frame(present_signal) {
+                            engine.backdrop.as_ref().map_or(false, |backdrop| {
+                                failed_present(&mut compositor, &engine.context, backdrop)
+                            })
+                        } else {
+                            false
                         }
                     }
+                    BackdropSource::Local => {
+                        let Some(window) = route.window else {
+                            continue;
+                        };
+                        let fresh = local_signal.get(&window).copied().unwrap_or(0);
+                        let changed =
+                            fresh != local_seen_version.get(&window).copied().unwrap_or(0);
+                        if compositor.wants_frame(changed) {
+                            match local_backdrop(&engine, window) {
+                                Some(backdrop) => {
+                                    // `failed_present` needs a `&mut
+                                    // compositor` while `backdrop` borrows
+                                    // `engine`: clone the cheap COM view
+                                    // out of the engine borrow first.
+                                    let backdrop = backdrop.clone();
+                                    failed_present(&mut compositor, &engine.context, &backdrop)
+                                }
+                                None => false,
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if device_lost {
+                    eprintln!(
+                        "Glassbar glass device removed (driver reset); \
+                         stopping the glass engine"
+                    );
+                    engine.render_running.store(false, Ordering::Relaxed);
+                    break 'main;
                 }
             }
+            // Everything that needed the newest frame version saw it; the
+            // next versions become the following tick's fresh signal.
+            local_seen_version.extend(local_signal.drain());
             drop(engine);
             // The session-level rate cap (Windows 11 22H2+): WGC coalesces
             // its frame deliveries to the interval, so the capture callback
-            // — and its full-monitor blit — never even run above the cap.
-            // Applied outside the state lock, only when the interval moved
-            // (tier change or fullscreen transition). Older systems ignore
-            // this and rely on the callback's `capture_due` gate.
+            // — and its blit — never even run above the cap. Applied
+            // outside the state lock, only when the interval moved (tier
+            // change or fullscreen transition), to BOTH the monitor feed
+            // and every live local feed. Older systems ignore this and
+            // rely on the callbacks' capture-due gates.
             if effective_interval != applied_session_interval {
                 applied_session_interval = effective_interval;
-                if let Some(active_feed) =
-                    feed.lock().expect("shared glass feed lock poisoned").as_ref()
+                if let Some(active_feed) = feed
+                    .lock()
+                    .expect("shared glass feed lock poisoned")
+                    .as_ref()
                 {
                     active_feed.set_min_update_interval(effective_interval);
                 }
+                for local_feed in local_feeds
+                    .lock()
+                    .expect("shared glass local feed lock poisoned")
+                    .values()
+                {
+                    local_feed.set_min_update_interval(effective_interval);
+                }
             }
-            // Feed lifecycle, strictly outside the state lock: starting the
-            // feed re-locks it, and dropping a feed while its own frame
-            // callback blocks on that lock could deadlock the teardown.
+            // GLOBAL feed lifecycle, strictly outside the state lock:
+            // starting the feed re-locks it, and dropping a feed while its
+            // own frame callback blocks on that lock could deadlock the
+            // teardown.
             if broker_attached {
-                // The broker publishes the backdrop: the local capture and
-                // blur pipeline is pure duplicate cost — tear it down. The
-                // broker's own feed is parked through the slot's active flag
-                // (the client wrote it) whenever every local surface sleeps.
+                // The broker publishes the backdrop: the monitor capture
+                // and blur pipeline is pure duplicate cost — tear it down.
+                // The broker's own feed is parked through the slot's active
+                // flag (the client wrote it) whenever every global surface
+                // sleeps.
                 idle_ticks = 0;
                 *feed.lock().expect("shared glass feed lock poisoned") = None;
-            } else if any_active {
+            } else if any_global_active {
                 idle_ticks = 0;
-                if restart_backoff > 0 {
-                    restart_backoff -= 1;
-                } else if !feed
-                    .lock()
-                    .expect("shared glass feed lock poisoned")
-                    .is_some()
+                if restart_backoff.ready()
+                    && !feed
+                        .lock()
+                        .expect("shared glass feed lock poisoned")
+                        .is_some()
                 {
                     match CaptureFeed::start(&host, &version) {
                         Ok(new_feed) => {
+                            restart_backoff.note_success();
                             *feed.lock().expect("shared glass feed lock poisoned") = Some(new_feed)
                         }
-                        Err(error) => {
-                            eprintln!("Glassbar shared capture failed to start: {error}");
-                            restart_backoff = IDLE_FEED_TICKS;
-                        }
+                        Err(error) => restart_backoff.note_failure("shared capture", &error),
                     }
                 }
             } else {
                 idle_ticks += 1;
                 if idle_ticks >= IDLE_FEED_TICKS {
                     idle_ticks = 0;
-                    // Every surface is parked: the capture session is torn
-                    // down so the OS capture pipeline idles with it. The
-                    // last backdrop stays cached; the first surface to wake
-                    // restarts the feed above and composites immediately
-                    // from the cached backdrop while the first frame flies.
+                    // Every Global surface is parked: the monitor capture is
+                    // torn down so the OS capture pipeline idles with it.
+                    // The last backdrop stays cached; the first surface to
+                    // wake restarts the feed above and composites
+                    // immediately from the cached backdrop while the first
+                    // frame flies.
                     *feed.lock().expect("shared glass feed lock poisoned") = None;
+                }
+            }
+            // LOCAL feed lifecycles, also strictly outside the state lock:
+            // one capture session per consumed window, started with the
+            // first awake surface over it and idled out on the same
+            // hysteresis. The per-window awake flags are snapshotted under
+            // a quick lock, then acted on with the state lock released.
+            let local_awake: HashMap<isize, bool> = {
+                let engine = state.lock().expect("shared glass lock poisoned");
+                engine
+                    .local
+                    .keys()
+                    .copied()
+                    .map(|window| {
+                        let awake = engine.surfaces.iter().any(|(_, compositor, route)| {
+                            route.consumes_window(window)
+                                && compositor.lock().map(|c| !c.is_paused()).unwrap_or(true)
+                        });
+                        (window, awake)
+                    })
+                    .collect()
+            };
+            let mut feeds = local_feeds
+                .lock()
+                .expect("shared glass local feed lock poisoned");
+            // Windows whose last surface unregistered: drop their retry
+            // bookkeeping so a later re-registration starts fresh.
+            local_restarts.retain(|window, _| local_awake.contains_key(window));
+            for (window, awake) in local_awake {
+                if awake {
+                    if let Some(ticks) = local_idle_ticks.get_mut(&window) {
+                        *ticks = 0;
+                    }
+                    if !feeds.contains_key(&window) {
+                        let backoff = local_restarts.entry(window).or_insert_with(RestartBackoff::new);
+                        if !backoff.ready() {
+                            continue;
+                        }
+                        // Feeds are started (and their deadlocked-teardown
+                        // hazard managed) only ever outside the engine lock.
+                        match start_local_feed(&state, window) {
+                            Ok(new_feed) => {
+                                backoff.note_success();
+                                feeds.insert(window, new_feed);
+                            }
+                            Err(error) => backoff.note_failure(
+                                &format!("the local capture of window {window}"),
+                                &error,
+                            ),
+                        }
+                    }
+                } else if let Some(ticks) = local_idle_ticks.get_mut(&window) {
+                    *ticks += 1;
+                    if *ticks >= IDLE_FEED_TICKS {
+                        *ticks = 0;
+                        // The window's glass is parked: its capture session
+                        // is torn down (the cached backdrop stays alive for
+                        // the wake-up composite).
+                        feeds.remove(&window);
+                    }
                 }
             }
         }
     });
+}
+
+/// Runs one compositor present for the routed backdrop and reports whether
+/// the failure signals a lost device (a driver reset — common on saturated
+/// integrated GPUs — fails every later call: stopping the loop lets the
+/// driver recover instead of crash-looping it. The glass freezes on its
+/// last frame until the app restarts).
+fn failed_present(
+    compositor: &mut crate::surface::D3D11Compositor,
+    context: &ID3D11DeviceContext,
+    backdrop: &Backdrop,
+) -> bool {
+    if let Err(error) = compositor.present(context, backdrop) {
+        // A failed present means the surface silently never appears (hosts
+        // gate reveals on `has_presented`); surfacing the error here is
+        // the only way to see it.
+        eprintln!("Glassbar surface render failed: {error}");
+        return true;
+    }
+    false
 }
 
 /// How the Kawase chain should run for the current params.
@@ -868,8 +1177,8 @@ impl BlurEngine {
         }
         let sampler = create_linear_clamp_sampler(device);
         let crop_current = CropConstants::identity([0.0, 0.0]);
-        let crop = constant_buffer(device, &crop_current)
-            .expect("Could not create the blur crop buffer");
+        let crop =
+            constant_buffer(device, &crop_current).expect("Could not create the blur crop buffer");
         Self {
             device: device.clone(),
             vertex_shader: vertex_shader.expect("Kawase vertex shader missing"),
@@ -929,7 +1238,12 @@ impl BlurEngine {
             || self.chain_frame != [width, height]
             || self.chain_plan.as_ref() != Some(&plan)
         {
-            self.chain = Some(build_kawase_chain(&self.device, width, height, plan.levels)?);
+            self.chain = Some(build_kawase_chain(
+                &self.device,
+                width,
+                height,
+                plan.levels,
+            )?);
             self.chain_frame = [width, height];
             self.chain_plan = Some(plan);
         }
@@ -942,24 +1256,10 @@ impl BlurEngine {
             for (level, target) in chain.down.iter().enumerate() {
                 let (width, height) = chain_target_size(chain, level);
                 if level == 0 {
-                    draw_kawase_pass(
-                        context,
-                        &self.crop_shader,
-                        target,
-                        capture,
-                        width,
-                        height,
-                    );
+                    draw_kawase_pass(context, &self.crop_shader, target, capture, width, height);
                 } else {
                     let source = &chain.down[level - 1].srv;
-                    draw_kawase_pass(
-                        context,
-                        &self.down_shader,
-                        target,
-                        source,
-                        width,
-                        height,
-                    );
+                    draw_kawase_pass(context, &self.down_shader, target, source, width, height);
                 }
             }
             // Up side: expand from the deepest level back to down0's
@@ -1360,7 +1660,10 @@ mod tests {
         // The level count is untouched by the tier (only the user's
         // samples setting caps it).
         params.blur_radius_texels = 32.0;
-        assert_eq!(blur_plan_with_caps(&params, &QualityCaps::EFFICIENCY).levels, 4);
+        assert_eq!(
+            blur_plan_with_caps(&params, &QualityCaps::EFFICIENCY).levels,
+            4
+        );
     }
 
     #[test]

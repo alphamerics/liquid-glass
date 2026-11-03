@@ -7,22 +7,30 @@ use windows::Win32::{
 };
 
 use super::compositor::D3D11Compositor;
-use super::geometry::{anchor_rect, height, overlay_bounds, primary_monitor_bounds, width};
+use super::geometry::{
+    anchor_rect, height, overlay_bounds, primary_monitor_bounds, width, window_frame_rect,
+};
 use super::window::{
-    create_surface_window, hide_surface_window, stack_beneath_host, translate_surface_window,
+    create_surface_window, hide_surface_window, stack_above_host, stack_beneath_host,
+    translate_surface_window,
 };
 use super::SharedCompositor;
-use crate::params::{GlassConfig, GlassShaderParams, RevealAnimation, SurfaceAnchor};
+use crate::backdrop::SurfaceRoute;
+use crate::params::{
+    BackdropSource, GlassConfig, GlassShaderParams, RevealAnimation, SurfaceAnchor,
+};
 use crate::shared::engine;
 
-/// DXGI D3D11 presentation target positioned beneath a host overlay window.
-/// Create one per overlay with [`GlassSurface::create`]; keep it alive while
-/// the glass should render. Dropping it stops the capture and destroys the
-/// native surface window.
+/// DXGI D3D11 presentation target positioned beneath (or above) a host
+/// window. Create one per glass element with [`GlassSurface::create`]; keep
+/// it alive while the glass should render. Dropping it stops the window's
+/// capture (if Local) and destroys the native surface window, and the
+/// GLOBAL monitor capture with the last Global surface's drop.
 ///
-/// All surfaces share one D3D11 device, one capture session and one render
-/// loop (see the shared engine); a surface only owns its window, swap chain
-/// and compositor state.
+/// All surfaces share one D3D11 device and one render loop (see the shared
+/// engine). Each surface is fed by its declared backdrop source
+/// ([`GlassConfig::backdrop_source`]): Global surfaces sample the shared
+/// monitor capture; Local surfaces a per-window capture of their host app.
 pub struct GlassSurface {
     host: isize,
     hwnd: HWND,
@@ -33,18 +41,25 @@ pub struct GlassSurface {
     surface_anchor: SurfaceAnchor,
     surface_height_px: f32,
     style_host_window: bool,
+    backdrop_source: BackdropSource,
+    placement: crate::params::SurfacePlacement,
 }
 
 unsafe impl Send for GlassSurface {}
 
 impl GlassSurface {
-    /// Creates the GPU surface beneath `host` (an HWND value) and joins the
-    /// shared capture.
+    /// Creates the GPU surface for `host` (an HWND value) and joins the
+    /// shared engine's feeds.
     pub fn create(host: isize, config: GlassConfig) -> Result<Self, String> {
         let shared = engine();
         let overlay = HWND(host as *mut _);
         let bounds = anchor_rect(overlay_bounds(overlay)?, &config.surface_anchor);
-        let primary_monitor_bounds = primary_monitor_bounds()?;
+        // The backdrop's uv space: the monitor for Global glass, the host
+        // window's own frame for Local glass.
+        let backdrop_space = match config.backdrop_source {
+            BackdropSource::Global => primary_monitor_bounds()?,
+            BackdropSource::Local => window_frame_rect(host)?,
+        };
         let hwnd = create_surface_window(bounds)?;
         let compositor = {
             let device = shared
@@ -60,14 +75,16 @@ impl GlassSurface {
                 width(&bounds)?,
                 height(&bounds)?,
                 bounds,
-                primary_monitor_bounds,
+                backdrop_space,
+                config.backdrop_source == BackdropSource::Global,
                 {
                     // The configured corner radius is expressed in surface
                     // pixels and translated into the SDF's normalized capsule
                     // radius. Texel-unit params are compensated for the
                     // downscaled shared capture here, so callers keep passing
                     // full-resolution values.
-                    let mut shader_params = scale_texel_params(config.shader, shared.capture_scale());
+                    let mut shader_params =
+                        scale_texel_params(config.shader, shared.capture_scale());
                     shader_params.capsule_radius =
                         (config.corner_radius_px / height(&bounds)? as f32).clamp(0.0, 0.5);
                     shader_params
@@ -93,20 +110,38 @@ impl GlassSurface {
             surface_anchor: config.surface_anchor,
             surface_height_px: height(&bounds)? as f32,
             style_host_window: config.style_host_window,
+            backdrop_source: config.backdrop_source,
+            placement: config.placement,
         };
         unsafe {
             // Display affinity keeps the GPU surface itself out of every
             // screen capture, including the shared WGC feed: without it the
-            // glass would refract its own rendered pixels (a feedback loop).
-            SetWindowDisplayAffinity(surface.hwnd, WDA_EXCLUDEFROMCAPTURE).map_err(|error| {
-                format!("Could not exclude the GPU surface from capture: {error}")
-            })?;
-            stack_beneath_host(
-                surface.host,
-                surface.hwnd,
-                &surface.surface_anchor,
-                surface.style_host_window,
-            )?;
+            // glass would refract its own rendered pixels (a feedback
+            // loop). Local glass can opt out — its per-window capture
+            // excludes overlapping windows on its own.
+            if config.exclude_from_capture {
+                SetWindowDisplayAffinity(surface.hwnd, WDA_EXCLUDEFROMCAPTURE).map_err(
+                    |error| format!("Could not exclude the GPU surface from capture: {error}"),
+                )?;
+            }
+            match surface.placement {
+                crate::params::SurfacePlacement::BeneathHost => {
+                    stack_beneath_host(
+                        surface.host,
+                        surface.hwnd,
+                        &surface.surface_anchor,
+                        surface.style_host_window,
+                    )?;
+                }
+                crate::params::SurfacePlacement::AboveHost => {
+                    stack_above_host(
+                        surface.host,
+                        surface.hwnd,
+                        &surface.surface_anchor,
+                        surface.style_host_window,
+                    )?;
+                }
+            }
         }
         // Initialize the swap chain to fully transparent: the first real
         // frame can be arbitrarily late and an uninitialized buffer renders
@@ -118,7 +153,13 @@ impl GlassSurface {
                 .expect("D3D11 compositor lock poisoned")
                 .clear_to_transparent(context)
         })?;
-        surface.engine_id = shared.register(Arc::clone(&surface.compositor));
+        surface.engine_id = shared.register(
+            Arc::clone(&surface.compositor),
+            match surface.backdrop_source {
+                BackdropSource::Global => SurfaceRoute::global(),
+                BackdropSource::Local => SurfaceRoute::local(host),
+            },
+        );
         Ok(surface)
     }
 
@@ -295,15 +336,37 @@ impl GlassSurface {
         });
     }
 
-    /// Aligns the native surface with its host window while retaining its
-    /// lower Z order. Call whenever the host moves or resizes.
+    /// Aligns the native surface with its host window (keeping its
+    /// placement's Z relation). Call whenever the host moves or resizes —
+    /// for a Local surface this also re-maps the samples into the host's
+    /// fresh window frame.
     pub fn sync_bounds(&mut self, host: isize) -> Result<(), String> {
         if host != self.host {
             return Err("Host window handle changed; create a new GlassSurface".to_owned());
         }
-        unsafe { stack_beneath_host(host, self.hwnd, &self.surface_anchor, self.style_host_window)? }
+        unsafe {
+            match self.placement {
+                crate::params::SurfacePlacement::BeneathHost => stack_beneath_host(
+                    host,
+                    self.hwnd,
+                    &self.surface_anchor,
+                    self.style_host_window,
+                )?,
+                crate::params::SurfacePlacement::AboveHost => stack_above_host(
+                    host,
+                    self.hwnd,
+                    &self.surface_anchor,
+                    self.style_host_window,
+                )?,
+            }
+        }
         let bounds = anchor_rect(overlay_bounds(HWND(host as *mut _))?, &self.surface_anchor);
-        let primary_monitor_bounds = primary_monitor_bounds()?;
+        // The backdrop's uv space follows the source: the monitor frame for
+        // Global glass, the host window's own frame for Local glass.
+        let backdrop_space = match self.backdrop_source {
+            BackdropSource::Global => primary_monitor_bounds()?,
+            BackdropSource::Local => window_frame_rect(host)?,
+        };
         self.surface_height_px = height(&bounds)? as f32;
         self.with_context(|context| {
             self.compositor
@@ -314,7 +377,7 @@ impl GlassSurface {
                     width(&bounds)?,
                     height(&bounds)?,
                     bounds,
-                    primary_monitor_bounds,
+                    backdrop_space,
                 )
         })
     }
@@ -324,6 +387,15 @@ impl GlassSurface {
     pub fn set_anchor(&mut self, anchor: SurfaceAnchor) -> Result<(), String> {
         self.surface_anchor = anchor;
         self.sync_bounds(self.host)
+    }
+
+    /// Stores a new anchor WITHOUT re-syncing the surface. Use when a host
+    /// window resize lands immediately afterwards: the resize's own sync
+    /// pass then applies the new anchor against the fresh bounds in the
+    /// same window operation, instead of the old anchor against the new
+    /// bounds (a one-frame wrong-geometry flash).
+    pub fn set_anchor_quiet(&mut self, anchor: SurfaceAnchor) {
+        self.surface_anchor = anchor;
     }
 
     /// The surface window's raw handle. Callers that must move the window
@@ -360,10 +432,7 @@ impl Drop for GlassSurface {
 /// Compensates texel-unit shader params for the downscaled shared capture:
 /// blur, refraction and chromatic displacement are expressed in capture
 /// texels, and a half-resolution capture has double-size texels.
-fn scale_texel_params(
-    mut params: GlassShaderParams,
-    scale: f32,
-) -> GlassShaderParams {
+fn scale_texel_params(mut params: GlassShaderParams, scale: f32) -> GlassShaderParams {
     if (scale - 1.0).abs() < f32::EPSILON {
         return params;
     }

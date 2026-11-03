@@ -58,6 +58,21 @@ pub(super) fn overlay_bounds(overlay: HWND) -> Result<RECT, String> {
     }
 }
 
+/// The rectangle of a window in screen space — the LOCAL feed's capture
+/// item covers exactly this frame, so a Local surface's samples are mapped
+/// into it by the source-rect constants.
+pub(crate) fn window_frame_rect(window: isize) -> Result<RECT, String> {
+    unsafe {
+        let mut bounds = RECT::default();
+        GetWindowRect(HWND(window as *mut _), &mut bounds)
+            .map_err(|error| format!("Could not read the host window bounds: {error}"))?;
+        if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+            return Err("Host window bounds are empty".to_owned());
+        }
+        Ok(bounds)
+    }
+}
+
 pub(crate) fn primary_monitor_bounds() -> Result<RECT, String> {
     unsafe {
         let monitor = MonitorFromPoint(Default::default(), MONITOR_DEFAULTTOPRIMARY);

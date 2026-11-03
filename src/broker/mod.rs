@@ -131,13 +131,9 @@ pub(crate) fn device_adapter_luid(
     let dxgi: IDXGIDevice = device
         .cast()
         .map_err(|error| format!("Could not obtain the DXGI device: {error}"))?;
-    let adapter = unsafe {
-        dxgi.GetAdapter()
-    }
-    .map_err(|error| format!("Could not obtain the glass adapter: {error}"))?;
-    let desc = unsafe {
-        adapter.GetDesc()
-    }
-    .map_err(|error| format!("Could not describe the glass adapter: {error}"))?;
+    let adapter = unsafe { dxgi.GetAdapter() }
+        .map_err(|error| format!("Could not obtain the glass adapter: {error}"))?;
+    let desc = unsafe { adapter.GetDesc() }
+        .map_err(|error| format!("Could not describe the glass adapter: {error}"))?;
     Ok(protocol::adapter_luid(desc.AdapterLuid))
 }

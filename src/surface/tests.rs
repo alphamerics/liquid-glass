@@ -3,7 +3,7 @@ use std::mem::size_of;
 use super::compositor::compile_shader;
 use super::geometry::source_rect_constants;
 use crate::params::GlassShaderParams;
-use crate::shared::{KAWASE_HLSL, compile_shader_from};
+use crate::shared::{compile_shader_from, KAWASE_HLSL};
 use windows::Win32::Foundation::RECT;
 
 #[test]

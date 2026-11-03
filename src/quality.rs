@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
-use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIAdapter1};
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice};
 
 /// The user-facing performance preset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -186,8 +186,8 @@ pub fn on_battery() -> bool {
 /// where the backdrop rate drops to the tier's fullscreen cap.
 pub fn fullscreen_foreground() -> bool {
     use windows::Win32::UI::Shell::{
-        QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
-        SHQueryUserNotificationState,
+        SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+        QUNS_RUNNING_D3D_FULL_SCREEN,
     };
     let Ok(state) = (unsafe { SHQueryUserNotificationState() }) else {
         return false;

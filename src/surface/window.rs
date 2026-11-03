@@ -1,11 +1,12 @@
 use windows::Win32::{
-    Foundation::{HWND, RECT, LPARAM, LRESULT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, GetWindowRect, RegisterClassW, SetLayeredWindowAttributes,
-        SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HTTRANSPARENT, HWND_TOPMOST,
-        LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, GetWindow, GetWindowLongW, GetWindowRect, RegisterClassW,
+        SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+        GW_HWNDPREV, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     },
 };
 
@@ -79,6 +80,61 @@ pub(super) fn hide_surface_window(hwnd: HWND) -> Result<(), String> {
             .ok()
             .map_err(|error| format!("Could not hide the glass surface: {error}"))
     }
+}
+
+/// Aligns the native surface with its host window while keeping it directly
+/// ABOVE the host in the z-order — the layout of glass elements living
+/// inside a content app (glass over a video pane, a document). The glass
+/// must STICK to its own app window, not float above the desktop: it is
+/// inserted immediately above the host, in the host's own topmost or
+/// non-topmost band, so it follows the host through activation and
+/// occlusion. The host re-runs this on every WM_WINDOWPOSCHANGED (which the
+/// system also sends when its z-order changes), so a raise re-pins the
+/// glass right above it again.
+pub(super) unsafe fn stack_above_host(
+    host: isize,
+    hwnd: HWND,
+    anchor: &SurfaceAnchor,
+    style_host_window: bool,
+) -> Result<(), String> {
+    let overlay = HWND(host as *mut _);
+    let bounds = anchor_rect(overlay_bounds(overlay)?, anchor);
+    // The window the surface is inserted below: the host's current
+    // upper neighbour, which leaves the surface exactly one slot above
+    // the host. Inserting below a TOPMOST window would drag the surface
+    // into the topmost band, so a normal-band host only follows
+    // non-topmost neighbours — when it is already the top of its band
+    // (the common case: just activated) the surface sits at the top of
+    // the band, directly above it. A topmost host (a shell overlay)
+    // keeps its glass in the topmost band with the same neighbour rule.
+    let host_style = GetWindowLongW(overlay, GWL_EXSTYLE);
+    let host_is_topmost = (host_style & WS_EX_TOPMOST.0 as i32) != 0;
+    let upper_neighbour = GetWindow(overlay, GW_HWNDPREV)
+        .ok()
+        .filter(|above| !above.is_invalid())
+        .filter(|above| {
+            let style = GetWindowLongW(*above, GWL_EXSTYLE);
+            let above_topmost = (style & WS_EX_TOPMOST.0 as i32) != 0;
+            above_topmost == host_is_topmost
+        });
+    SetWindowPos(
+        hwnd,
+        upper_neighbour.unwrap_or(if host_is_topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        }),
+        bounds.left,
+        bounds.top,
+        bounds.right - bounds.left,
+        bounds.bottom - bounds.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    )
+    .map_err(|error| format!("Could not position the GPU surface: {error}"))?;
+    if style_host_window {
+        crate::borderless::configure_borderless_host(host)?;
+    }
+    Ok(())
 }
 
 /// Aligns the native surface with its host window while retaining its lower

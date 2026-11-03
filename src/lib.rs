@@ -1,14 +1,23 @@
 //! # liquid-glass
 //!
-//! A reusable, GPU-composited "liquid glass" backdrop for Windows overlay
-//! windows — designed to drop into Tauri apps with one call.
+//! A reusable, GPU-composited "liquid glass" backdrop for Windows windows —
+//! designed to drop into Tauri apps with one call.
 //!
-//! The crate creates a native D3D11 surface window positioned directly
-//! beneath your (transparent) overlay window, captures the primary monitor
-//! with Windows Graphics Capture, and composites the captured pixels through
-//! a liquid-glass shader (refraction, blur, chromatic dispersion, tint). The
-//! shader is fully customizable at runtime via [`GlassShaderParams`], and the
-//! native corner shape via [`GlassConfig::corner_radius_px`].
+//! The crate creates a native D3D11 surface window positioned beneath (or
+//! above) your window, and composites a liquid-glass shader (refraction,
+//! blur, chromatic dispersion, tint) over a backdrop feed. One drawer, two
+//! feeds (see [`GlassConfig::backdrop_source`]):
+//!
+//! - **Global** — the primary monitor, captured with Windows Graphics
+//!   Capture and blurred once for every surface in the session: the glass
+//!   refracts *everything* behind it (the classic Glassbar overlay look).
+//! - **Local** — the app's own window, captured and blurred by itself:
+//!   glass elements that live inside an app (a container, button or slider
+//!   over its own content) need no screen duplication at all, and an app
+//!   with only Local surfaces runs with no monitor capture and no broker.
+//!
+//! The shader is fully customizable at runtime via [`GlassShaderParams`],
+//! and the native corner shape via [`GlassConfig::corner_radius_px`].
 //!
 //! ## Tauri usage
 //!
@@ -22,7 +31,15 @@
 //! // focus changes (tao always keeps WS_CAPTION in the style).
 //! liquid_glass::install_activation_subclass(hwnd)?;
 //!
+//! // Global glass behind a transparent overlay (the default):
 //! let surface = GlassSurface::create(hwnd, GlassConfig::default())?;
+//!
+//! // Local glass over the window's own content:
+//! let in_app = GlassSurface::create(hwnd, GlassConfig {
+//!     backdrop_source: liquid_glass::BackdropSource::Local,
+//!     placement: liquid_glass::SurfacePlacement::AboveHost,
+//!     ..Default::default()
+//! })?;
 //!
 //! // Live-tune the material:
 //! surface.set_shader_params(liquid_glass::GlassShaderParams {
@@ -32,28 +49,31 @@
 //! })?;
 //!
 //! // On window move/resize events: surface.sync_bounds(hwnd)?;
-//! // Dropping `surface` stops the capture and destroys the surface window.
+//! // Dropping `surface` stops its feed and destroys the surface window.
 //! ```
 //!
 //! The crate is intentionally Tauri-free: it only needs an `isize` HWND, so
 //! it works with tao, winit, raw Win32, or any framework.
 
+mod backdrop;
 mod borderless;
-pub mod params;
 pub mod broker;
+pub(crate) mod capture;
+pub mod params;
 pub mod quality;
 mod shared;
 mod surface;
 pub mod thumbnail;
-
-pub(crate) mod capture;
+pub(crate) mod window_capture;
 
 pub use borderless::{configure_borderless_host, install_activation_subclass};
-pub use params::{GlassConfig, GlassShaderParams, Material, RevealAnimation, SurfaceAnchor};
-pub use quality::{QualityMode, QualityCaps};
+pub use params::{
+    BackdropSource, GlassConfig, GlassShaderParams, Material, RevealAnimation, SurfaceAnchor,
+    SurfacePlacement,
+};
+pub use quality::{QualityCaps, QualityMode};
 pub use surface::{
-    translate_compositor, translate_surface_window, D3D11Compositor, GlassSurface,
-    SharedCompositor,
+    translate_compositor, translate_surface_window, D3D11Compositor, GlassSurface, SharedCompositor,
 };
 pub use thumbnail::ThumbnailSurface;
 

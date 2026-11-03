@@ -29,9 +29,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use windows::core::{Interface, HRESULT};
 use windows::Graphics::SizeInt32;
-use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, HANDLE, DUPLICATE_SAME_ACCESS,
-};
+use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11ShaderResourceView,
     ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
@@ -47,7 +45,7 @@ use windows::Win32::System::Threading::{
 
 use super::device_adapter_luid;
 use super::protocol::{
-    ConsumerSlot, CONSUMER_SLOTS, Manifest, ManifestView, SLOT_REQUESTED, SLOT_SUPPLIED,
+    ConsumerSlot, Manifest, ManifestView, CONSUMER_SLOTS, SLOT_REQUESTED, SLOT_SUPPLIED,
     SLOT_UNUSED,
 };
 use crate::capture::CaptureFeed;
@@ -126,7 +124,9 @@ pub fn run() -> i32 {
             return 1;
         }
     }
-    manifest.broker_pid.store(std::process::id(), Ordering::Release);
+    manifest
+        .broker_pid
+        .store(std::process::id(), Ordering::Release);
 
     // The shared engine's parts, mirroring the in-process engine's setup:
     // one host (capture delivery), one feed (restarted on demand), one
@@ -184,9 +184,7 @@ pub fn run() -> i32 {
             engine.invalidate_backdrop();
         }
         let now = Instant::now();
-        if last_fullscreen_check
-            .map_or(true, |at| now.duration_since(at) >= FULLSCREEN_POLL)
-        {
+        if last_fullscreen_check.map_or(true, |at| now.duration_since(at) >= FULLSCREEN_POLL) {
             last_fullscreen_check = Some(now);
             fullscreen = fullscreen_foreground();
         }
@@ -214,9 +212,14 @@ pub fn run() -> i32 {
                 material_revision,
                 &quality_caps,
             );
-            if let Err(error) =
-                engine.publish_inner(&device, &context, &host_guard, manifest, host_version, &quality_caps)
-            {
+            if let Err(error) = engine.publish_inner(
+                &device,
+                &context,
+                &host_guard,
+                manifest,
+                host_version,
+                &quality_caps,
+            ) {
                 if last_publish_error.as_deref() != Some(error.as_str()) {
                     eprintln!("glass broker publish failed: {error}");
                     last_publish_error = Some(error);
@@ -296,8 +299,18 @@ impl ConsumerRegistry {
         let manifest = view.manifest();
         for index in 0..CONSUMER_SLOTS {
             let slot = manifest.slot(index);
-            if slot.pid.load(Ordering::Acquire) != 0
-                && slot.active.load(Ordering::Acquire) != 0
+            if slot.pid.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            // A waiting handshake counts as active too: the shared pair the
+            // handshake supplies is built by the publish path, which needs
+            // capture frames — and the capture's copy gate reads THIS
+            // answer. The consumer's own active flag only lands after the
+            // attach completes, so without this the handshake can never
+            // start (the broker waits for an active consumer, the consumer
+            // waits for the broker's share).
+            if slot.active.load(Ordering::Acquire) != 0
+                || slot.state.load(Ordering::Acquire) == SLOT_REQUESTED
             {
                 return true;
             }
@@ -358,9 +371,7 @@ fn maintain(manifest: &Manifest, pair: Option<&SharedPair>, my_pid: u32) {
                         slot.state.store(SLOT_SUPPLIED, Ordering::Release);
                     }
                     Err(error) => {
-                        eprintln!(
-                            "glass broker could not share with consumer pid {pid}: {error}"
-                        );
+                        eprintln!("glass broker could not share with consumer pid {pid}: {error}");
                     }
                 }
             }
@@ -512,8 +523,7 @@ impl PublishEngine {
                         Height: height,
                         MipLevels: 1,
                         ArraySize: 1,
-                        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0
-                            as u32,
+                        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
                         Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
                         SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
                             Count: 1,
@@ -534,12 +544,9 @@ impl PublishEngine {
             })?;
             let texture = texture.expect("shared glass texture missing");
             let mut target = None;
-            unsafe {
-                device.CreateRenderTargetView(&texture, None, Some(&mut target))
-            }
-            .map_err(|error| {
-                format!("Could not create the shared glass target view: {error}")
-            })?;
+            unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut target)) }.map_err(
+                |error| format!("Could not create the shared glass target view: {error}"),
+            )?;
             let target = target.expect("shared glass target view missing");
             let resource = texture
                 .cast::<IDXGIResource1>()
@@ -677,9 +684,7 @@ impl PublishEngine {
             // size: a direct GPU copy suffices. The stable texture and the
             // pair share the format; the copy needs no bindings.
             let stable = sharp_source.expect("the sharp publication source exists");
-            unsafe {
-                context.CopyResource(&texture, &stable)
-            };
+            unsafe { context.CopyResource(&texture, &stable) };
             Ok(())
         } else {
             // A blur-reduced backdrop: bilinear-stretch it into the
@@ -738,11 +743,7 @@ impl crate::capture::FrameHost for BrokerHost {
         self.context.clone()
     }
 
-    fn set_frame(
-        &mut self,
-        frame: (ID3D11Texture2D, ID3D11ShaderResourceView),
-        size: SizeInt32,
-    ) {
+    fn set_frame(&mut self, frame: (ID3D11Texture2D, ID3D11ShaderResourceView), size: SizeInt32) {
         self.stable = Some(frame);
         self.frame_size = size;
         self.frame_version.fetch_add(1, Ordering::Release);
@@ -762,7 +763,8 @@ impl crate::capture::FrameHost for BrokerHost {
 
     fn capture_due(&mut self) -> bool {
         let due = self.backdrop_interval.map_or(true, |interval| {
-            self.last_copy.map_or(true, |last| last.elapsed() >= interval)
+            self.last_copy
+                .map_or(true, |last| last.elapsed() >= interval)
         });
         if due {
             self.last_copy = Some(Instant::now());

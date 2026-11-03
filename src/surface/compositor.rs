@@ -9,7 +9,7 @@ use windows::{
             Direct3D11::{
                 ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
                 ID3D11RenderTargetView, ID3D11SamplerState, ID3D11Texture2D, ID3D11VertexShader,
-                D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+                D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
                 D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
             },
             DirectComposition::{
@@ -30,9 +30,9 @@ use windows::{
     },
 };
 
-use super::SharedCompositor;
 use super::geometry::{primary_monitor_bounds, source_rect_constants, source_rect_constants_texel};
-use crate::shared::{Backdrop, CropConstants, compiled_shader, create_linear_clamp_sampler};
+use super::SharedCompositor;
+use crate::shared::{compiled_shader, create_linear_clamp_sampler, Backdrop, CropConstants};
 use crate::{
     params::{GlassShaderParams, RevealAnimation},
     SourceRectConstants,
@@ -115,6 +115,14 @@ pub struct D3D11Compositor {
     /// The surface's on-screen bounds (monitor-absolute pixels), needed to
     /// rebuild the source-rect constants when the surface moves.
     surface_bounds: RECT,
+    /// The rect of "space" the backdrop texture covers: the primary
+    /// monitor for the GLOBAL feed, the host app window's frame for the
+    /// LOCAL feed. The source-rect constants map the surface into it.
+    backdrop_space: RECT,
+    /// Whether the backdrop space is the monitor (GLOBAL feed). LOCAL
+    /// surfaces map into their host window's frame — samples must never be
+    /// re-anchored to the monitor (see `translate`).
+    monitor_space: bool,
     /// When true, `present` is a no-op: parked (hidden) surfaces render
     /// nothing at all, and their presentation tick only burns a boolean
     /// check.
@@ -169,7 +177,8 @@ impl D3D11Compositor {
         width: u32,
         height: u32,
         surface_bounds: RECT,
-        primary_monitor_bounds: RECT,
+        backdrop_space: RECT,
+        monitor_space: bool,
         shader_params: GlassShaderParams,
     ) -> Result<Self, String> {
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
@@ -256,16 +265,15 @@ impl D3D11Compositor {
         .map_err(|error| format!("Could not create the lite pixel shader: {error}"))?;
         let pixel_shader_lite = pixel_shader_lite.expect("lite pixel shader missing");
         let sampler = create_linear_clamp_sampler(device);
-        let source_rect_constants =
-            source_rect_constants(surface_bounds, primary_monitor_bounds)?;
+        let source_rect_constants = source_rect_constants(surface_bounds, backdrop_space)?;
         let source_rect = crate::shared::constant_buffer(device, &source_rect_constants)?;
         let glass_params = crate::shared::constant_buffer(device, &shader_params)?;
         // The shared engine blurs the WHOLE capture, so the composite's
-        // backdrop uv equals the capture uv (identity crop); the buffer only
-        // carries the capture texel size and the sharp-backdrop flag, both
-        // refreshed by `present`/`resize`.
+        // backdrop uv equals the capture uv (identity crop); the buffer
+        // only carries the capture texel size and the sharp-backdrop flag,
+        // both refreshed by `present`/`resize`.
         let crop_constants_current =
-            CropConstants::identity(source_rect_constants_texel(&primary_monitor_bounds));
+            CropConstants::identity(source_rect_constants_texel(&backdrop_space));
         let crop_constants = crate::shared::constant_buffer(device, &crop_constants_current)?;
         Ok(Self {
             device: device.clone(),
@@ -299,6 +307,8 @@ impl D3D11Compositor {
             reveal_last_frame: Instant::now(),
             has_presented: false,
             surface_bounds,
+            backdrop_space,
+            monitor_space,
             paused: false,
             pause_after_present: false,
             pause_when_collapsed: false,
@@ -690,11 +700,10 @@ impl D3D11Compositor {
         width: u32,
         height: u32,
         surface_bounds: RECT,
-        primary_monitor_bounds: RECT,
+        backdrop_space: RECT,
     ) -> Result<(), String> {
         self.surface_bounds = surface_bounds;
-        let source_rect_constants =
-            source_rect_constants(surface_bounds, primary_monitor_bounds)?;
+        let source_rect_constants = source_rect_constants(surface_bounds, backdrop_space)?;
         if source_rect_constants != self.source_rect_constants {
             unsafe {
                 context.UpdateSubresource(
@@ -709,8 +718,10 @@ impl D3D11Compositor {
             self.source_rect_constants = source_rect_constants;
         }
         // The capture texel size feeds the composite's displacement math in
-        // capture-uv units; a monitor change (DPI, resolution) moves it.
-        let texel = source_rect_constants_texel(&primary_monitor_bounds);
+        // capture-uv units; a monitor change (DPI, resolution) moves it —
+        // and for a LOCAL feed, a host window resize does.
+        self.backdrop_space = backdrop_space;
+        let texel = source_rect_constants_texel(&backdrop_space);
         if texel != self.crop_constants_current.capture_texel_uv {
             self.crop_constants_current.capture_texel_uv = texel;
             unsafe {
@@ -906,9 +917,14 @@ impl D3D11Compositor {
         params.pill_scale_y = self.pill_scale_y;
     }
 
-    /// Shifts the sampling origin down with the surface window (auto-hide slide).
+    /// Shifts the sampling origin down with the surface window (auto-hide
+    /// slide). A GLOBAL surface's samples hang in monitor space and follow
+    /// the slide; a LOCAL surface's samples hang in its host window's
+    /// frame, which does not move relative to the glass when the host's own
+    /// chrome slides — and Glassbar's auto-hide slide is a monitor-space
+    /// feature anyway, so never re-anchors there.
     pub fn translate(&mut self, context: &ID3D11DeviceContext, dy: i32) {
-        if dy == 0 {
+        if dy == 0 || !self.monitor_space {
             return;
         }
         self.surface_bounds.top += dy;
@@ -916,9 +932,7 @@ impl D3D11Compositor {
         let Ok(monitor) = primary_monitor_bounds() else {
             return;
         };
-        if let Ok(updated) =
-            source_rect_constants(self.surface_bounds, monitor)
-        {
+        if let Ok(updated) = source_rect_constants(self.surface_bounds, monitor) {
             unsafe {
                 context.UpdateSubresource(
                     &self.source_rect,

@@ -38,12 +38,12 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
+use super::device_adapter_luid;
 use super::protocol::{
-    snapshot, ConsumerSlot, CONSUMER_SLOTS, PROTOCOL_MAGIC, PROTOCOL_VERSION,
-    SLOT_REQUESTED, SLOT_SUPPLIED, SLOT_UNUSED, ManifestView, ATTACH_TIMEOUT, BROKER_EXE_NAME,
+    snapshot, ConsumerSlot, ManifestView, ATTACH_TIMEOUT, BROKER_EXE_NAME, CONSUMER_SLOTS,
+    PROTOCOL_MAGIC, PROTOCOL_VERSION, SLOT_REQUESTED, SLOT_SUPPLIED, SLOT_UNUSED,
 };
 use crate::shared::Backdrop;
-use super::device_adapter_luid;
 
 /// The attach/presence poll cadence.
 const PRESENCE_POLL: Duration = Duration::from_millis(500);
@@ -304,9 +304,9 @@ impl BrokerClient {
         if handles.iter().any(|handle| *handle == 0) {
             return Err("The broker supplied zero-valued glass handles".to_owned());
         }
-        let device1: ID3D11Device1 = device
-            .cast()
-            .map_err(|error| format!("Could not cast the glass device to ID3D11Device1: {error}"))?;
+        let device1: ID3D11Device1 = device.cast().map_err(|error| {
+            format!("Could not cast the glass device to ID3D11Device1: {error}")
+        })?;
         let mut textures: Vec<ID3D11Texture2D> = Vec::with_capacity(2);
         for raw_value in handles {
             let raw = HANDLE(raw_value as usize as *mut std::ffi::c_void);
@@ -420,9 +420,7 @@ impl BrokerClient {
         }
         self.last_version = version;
         Ok(Some(PulledFrame {
-            backdrop: Backdrop {
-                view: private_view,
-            },
+            backdrop: Backdrop { view: private_view },
         }))
     }
 
@@ -465,10 +463,8 @@ impl BrokerClient {
         .map_err(|error| format!("Could not create the glass copy backdrop: {error}"))?;
         let texture = texture.expect("the glass copy backdrop is missing");
         let mut view = None;
-        unsafe {
-            device.CreateShaderResourceView(&texture, None, Some(&mut view))
-        }
-        .map_err(|error| format!("Could not create the glass copy view: {error}"))?;
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view)) }
+            .map_err(|error| format!("Could not create the glass copy view: {error}"))?;
         self.private = Some(PrivateBackdrop {
             texture,
             view: view.expect("the glass copy view is missing"),
@@ -543,14 +539,13 @@ impl BrokerClient {
         {
             candidates.push(directory.join(BROKER_EXE_NAME));
         }
-        if let Some(mut shared) = super::material_path().and_then(|path| path.parent().map(|dir| dir.to_path_buf())) {
+        if let Some(mut shared) =
+            super::material_path().and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+        {
             shared.push(BROKER_EXE_NAME);
             candidates.push(shared);
         }
-        let found = candidates
-            .iter()
-            .find(|path| path.exists())
-            .cloned();
+        let found = candidates.iter().find(|path| path.exists()).cloned();
         match found {
             Some(path) => {
                 if let Err(error) = std::process::Command::new(&path)

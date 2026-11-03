@@ -24,10 +24,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use windows::core::w;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP, FILE_MAP_ALL_ACCESS, MapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
-    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP,
+    FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 
 /// The manifest's file mapping (session-local).
@@ -183,20 +183,18 @@ impl ManifestView {
     }
 
     fn existing_mapping() -> Option<HANDLE> {
-        unsafe {
-            OpenFileMappingW(
-                FILE_MAP_ALL_ACCESS.0,
-                false,
-                MANIFEST_NAME,
-            )
-            .ok()
-        }
+        unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, MANIFEST_NAME).ok() }
     }
 
     fn map(mapping: HANDLE) -> Result<*mut Manifest, String> {
         unsafe {
-            let view: MEMORY_MAPPED_VIEW_ADDRESS =
-                MapViewOfFile(mapping, FILE_MAP(FILE_MAP_ALL_ACCESS.0), 0, 0, Manifest::size_bytes());
+            let view: MEMORY_MAPPED_VIEW_ADDRESS = MapViewOfFile(
+                mapping,
+                FILE_MAP(FILE_MAP_ALL_ACCESS.0),
+                0,
+                0,
+                Manifest::size_bytes(),
+            );
             if view.Value.is_null() {
                 Err("Could not map the glass manifest view".to_owned())
             } else {

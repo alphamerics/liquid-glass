@@ -9,7 +9,7 @@ license = "MIT"
 name = "liquid_glass"
 
 [workspace]
-members = ["glass-broker", "glass-demo"]
+members = ["glass-broker"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
