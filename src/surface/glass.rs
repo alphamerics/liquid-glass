@@ -17,8 +17,7 @@ use super::window::{
 use super::SharedCompositor;
 use crate::backdrop::SurfaceRoute;
 use crate::params::{
-    BackdropSource, GlassConfig, GlassShape, GlassShaderParams, RevealAnimation,
-    SurfaceAnchor,
+    BackdropSource, GlassConfig, GlassShaderParams, GlassShape, RevealAnimation, SurfaceAnchor,
 };
 use crate::shared::engine;
 
@@ -46,7 +45,13 @@ pub struct GlassSurface {
     /// The shape region: the rect (in surface uv, origin top-left) the
     /// shape field lives in. Identity spans the whole surface.
     shape_region: [f32; 4],
+    /// The drawn shape's rect in surface-relative physical pixels
+    /// (x, y, width, height) when the shape is driven inside a fixed-size
+    /// canvas ([`GlassSurface::set_shape_rect_px`]); `None` keeps the
+    /// identity (the shape spans the whole surface).
+    shape_rect_px: Option<[f32; 4]>,
     surface_anchor: SurfaceAnchor,
+    surface_width_px: f32,
     surface_height_px: f32,
     style_host_window: bool,
     backdrop_source: BackdropSource,
@@ -117,7 +122,9 @@ impl GlassSurface {
             corner_radius_px: config.corner_radius_px,
             shape: config.shape,
             shape_region: [0.0, 0.0, 1.0, 1.0],
+            shape_rect_px: None,
             surface_anchor: config.surface_anchor,
+            surface_width_px: width(&bounds)? as f32,
             surface_height_px: height(&bounds)? as f32,
             style_host_window: config.style_host_window,
             backdrop_source: config.backdrop_source,
@@ -204,7 +211,7 @@ impl GlassSurface {
         mut params: GlassShaderParams,
     ) -> Result<(), String> {
         params.capsule_radius =
-            (self.corner_radius_px / self.surface_height_px.max(1.0)).clamp(0.0, 0.5);
+            (self.corner_radius_px / self.shape_height_px().max(1.0)).clamp(0.0, 0.5);
         self.set_shader_params(params)
     }
 
@@ -233,12 +240,58 @@ impl GlassSurface {
 
     /// Changes the pill's corner radius in surface pixels. Any radius is
     /// allowed, from square corners (`0.0`) to a full capsule (half the
-    /// surface height). The radius lives in the shader's SDF, so edges stay
+    /// shape's height). The radius lives in the shader's SDF, so edges stay
     /// antialiased through the composition alpha.
     pub fn set_corner_radius(&mut self, corner_radius_px: f32) -> Result<(), String> {
         self.corner_radius_px = corner_radius_px;
-        let radius_units = (corner_radius_px / self.surface_height_px.max(1.0)).clamp(0.0, 0.5);
+        let radius_units = (corner_radius_px / self.shape_height_px().max(1.0)).clamp(0.0, 0.5);
         self.shader_params.capsule_radius = radius_units;
+        self.upload_params()
+    }
+
+    /// The height (physical pixels) the shape's units normalize against:
+    /// the drawn shape rect's height when a shape rect is set (canvas
+    /// mode), the surface window's own height otherwise.
+    fn shape_height_px(&self) -> f32 {
+        self.shape_rect_px
+            .map(|rect| rect[3])
+            .unwrap_or(self.surface_height_px)
+    }
+
+    /// Moves and resizes the drawn shape WITHIN the surface window, in
+    /// surface-relative physical pixels (x, y, width, height), and sets the
+    /// pill's corner radius in the same step (normalized against the rect's
+    /// height). The surface window and its swap chain are NOT touched: the
+    /// resize lands as one constant-buffer update on the next frame, so the
+    /// shape can be retargeted every animation tick and resizes play back
+    /// at the render loop's full rate — no window resizes, no swap-chain
+    /// reallocation, no transparent flash.
+    ///
+    /// This is the smooth counterpart to resizing the surface itself (see
+    /// [`GlassSurface::sync_bounds`], which must reallocate the swap chain's
+    /// buffers): create the surface once at a fixed, generous canvas (a
+    /// [`SurfaceAnchor::Rect`] anchor with headroom) and drive the drawn
+    /// shape inside it.
+    pub fn set_shape_rect_px(
+        &mut self,
+        rect: [f32; 4],
+        corner_radius_px: f32,
+    ) -> Result<(), String> {
+        let (x, y, w, h) = (rect[0], rect[1], rect[2].max(1.0), rect[3].max(1.0));
+        // The shape can never exceed the canvas it is drawn on.
+        let w = w.min(self.surface_width_px.max(1.0));
+        let h = h.min(self.surface_height_px.max(1.0));
+        let x = x.clamp(0.0, (self.surface_width_px - w).max(0.0));
+        let y = y.clamp(0.0, (self.surface_height_px - h).max(0.0));
+        self.shape_rect_px = Some([x, y, w, h]);
+        self.shape_region = [
+            x / self.surface_width_px.max(1.0),
+            y / self.surface_height_px.max(1.0),
+            w / self.surface_width_px.max(1.0),
+            h / self.surface_height_px.max(1.0),
+        ];
+        self.corner_radius_px = corner_radius_px;
+        self.shader_params.capsule_radius = (corner_radius_px / h.max(1.0)).clamp(0.0, 0.5);
         self.upload_params()
     }
 
@@ -402,6 +455,7 @@ impl GlassSurface {
             BackdropSource::Global => primary_monitor_bounds()?,
             BackdropSource::Local => window_frame_rect(host)?,
         };
+        self.surface_width_px = width(&bounds)? as f32;
         self.surface_height_px = height(&bounds)? as f32;
         self.with_context(|context| {
             self.compositor

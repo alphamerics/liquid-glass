@@ -1034,7 +1034,9 @@ fn spawn_render_loop(
                         *ticks = 0;
                     }
                     if !feeds.contains_key(&window) {
-                        let backoff = local_restarts.entry(window).or_insert_with(RestartBackoff::new);
+                        let backoff = local_restarts
+                            .entry(window)
+                            .or_insert_with(RestartBackoff::new);
                         if !backoff.ready() {
                             continue;
                         }
@@ -1840,8 +1842,7 @@ mod tests {
         let nudged = grid_aligned_crop([103.0, 205.0, 505.0, 704.0], frame, 64.0).expect("rect");
         assert_eq!(rect, nudged);
         // Rects reaching past the frame clamp into it.
-        let clamped = grid_aligned_crop([-50.0, -50.0, 5000.0, 5000.0], frame, 64.0)
-            .expect("rect");
+        let clamped = grid_aligned_crop([-50.0, -50.0, 5000.0, 5000.0], frame, 64.0).expect("rect");
         assert_eq!(clamped, [0, 0, 1920, 1080]);
         // Degenerate rects (past the frame edge, empty after clamping)
         // fall back to no crop.
@@ -1857,18 +1858,21 @@ mod tests {
         let texel = [1.0 / 1920.0, 1.0 / 1080.0];
         // The identity crop maps every capture uv to itself.
         let identity = CropConstants::identity(texel);
-        assert_eq!(
-            backdrop_uv_of(&identity, [0.25, 0.75]),
-            [0.25, 0.75]
-        );
+        assert_eq!(backdrop_uv_of(&identity, [0.25, 0.75]), [0.25, 0.75]);
         // A sub-rect crop maps the region's corners to (0, 0) and (1, 1)
         // and its center to (0.5, 0.5) — exactly what the composite's
         // `backdropUv` does in the shader.
         let rect = [640, 360, 1280, 720];
         let crop = CropConstants::from_pixel_rect(rect, frame, texel);
         let map = |uv: [f32; 2]| backdrop_uv_of(&crop, uv);
-        assert_eq!(map([rect[0] as f32 / 1920.0, rect[1] as f32 / 1080.0]), [0.0, 0.0]);
-        assert_eq!(map([rect[2] as f32 / 1920.0, rect[3] as f32 / 1080.0]), [1.0, 1.0]);
+        assert_eq!(
+            map([rect[0] as f32 / 1920.0, rect[1] as f32 / 1080.0]),
+            [0.0, 0.0]
+        );
+        assert_eq!(
+            map([rect[2] as f32 / 1920.0, rect[3] as f32 / 1080.0]),
+            [1.0, 1.0]
+        );
         let center = map([960.0 / 1920.0, 540.0 / 1080.0]);
         assert!((center[0] - 0.5).abs() < 1e-6 && (center[1] - 0.5).abs() < 1e-6);
     }

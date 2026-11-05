@@ -46,8 +46,8 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIKeyedMutex, IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
-    PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_DUP_HANDLE,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use super::device_adapter_luid;
@@ -370,9 +370,7 @@ impl ConsumerLiveness {
                 }
             }
         }
-        match unsafe {
-            OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-        } {
+        match unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
             Ok(handle) => {
                 self.handles.insert(pid, handle);
                 true
@@ -477,7 +475,9 @@ fn duplicate_pair_process(pid: u32, cells: &[SharedCell; 2]) -> Result<[u64; 2],
     } {
         Ok(handle) => handle,
         Err(error) => {
-            return Err(format!("Could not open the glass consumer process: {error}"));
+            return Err(format!(
+                "Could not open the glass consumer process: {error}"
+            ));
         }
     };
     let result = duplicate_pair(process, cells);
@@ -595,7 +595,10 @@ impl PublishEngine {
         // Full-frame blur: the publication pass stretches the backdrop into
         // the monitor-sized shared pair, so consumers' geometry must not
         // depend on which region the chain covered.
-        match self.blur.render(context, view, size, None, &self.params, caps) {
+        match self
+            .blur
+            .render(context, view, size, None, &self.params, caps)
+        {
             Ok(backdrop) => {
                 self.backdrop = Some(backdrop);
                 self.backdrop_version = host_version;

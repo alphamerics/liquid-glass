@@ -372,8 +372,9 @@ impl BrokerClient {
             // The probe handle must be closed: an open handle leaked every
             // second pinned the broker's process object forever.
             let alive = broker_pid != 0
-                && match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, broker_pid) }
-                {
+                && match unsafe {
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, broker_pid)
+                } {
                     Ok(handle) => {
                         let valid = !handle.is_invalid();
                         unsafe {
