@@ -68,13 +68,11 @@ pub(crate) mod window_capture;
 
 pub use borderless::{configure_borderless_host, install_activation_subclass};
 pub use params::{
-    BackdropSource, GlassConfig, GlassShaderParams, Material, RevealAnimation, SurfaceAnchor,
-    SurfacePlacement,
+    BackdropSource, GlassConfig, GlassShaderParams, GlassShape, Material,
+    RevealAnimation, SurfaceAnchor, SurfacePlacement,
 };
 pub use quality::{QualityCaps, QualityMode};
-pub use surface::{
-    translate_compositor, translate_surface_window, D3D11Compositor, GlassSurface, SharedCompositor,
-};
+pub use surface::{translate_compositor, translate_surface_window, D3D11Compositor, GlassSurface, SharedCompositor};
 pub use thumbnail::ThumbnailSurface;
 
 /// Mirrors the shader's `SourceRect` constant buffer (register b0).

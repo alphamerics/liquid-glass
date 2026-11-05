@@ -52,7 +52,9 @@ pub struct GlassShaderParams {
     /// its lit corner anchor along the border. `0.0` auto-sizes to a
     /// quarter of the half-perimeter (the same border share lit on any
     /// surface size); explicit values are capped there so the front and
-    /// mirrored lobes never overlap.
+    /// mirrored lobes never overlap. A NEGATIVE value disables the anchor
+    /// fade entirely — every border point responds to the light by its own
+    /// bevel normal.
     pub outline_fade_px: f32,
     /// Polish of the rim: higher values tighten the specular glint into a
     /// thinner, sharper line (mirror-polished), lower values spread it into
@@ -110,8 +112,21 @@ pub struct GlassShaderParams {
     /// away from the light (0 disables it). This is what sells the specular
     /// rim as a physically raised ridge.
     pub rim_shadow_strength: f32,
-    /// Reserved padding keeping the constant buffer at eight 16-byte rows.
-    pub vibrancy_padding: [f32; 1],
+    /// Alignment filler: HLSL packs a `float4` to the next 16-byte constant
+    /// register, so the following `float4` rows must start on a register
+    /// boundary. Keeps the Rust layout in exact parity with the shader's
+    /// cbuffer.
+    pub cbuffer_align: [f32; 1],
+    /// The SHAPE REGION: the rect (in surface uv, origin top-left) the
+    /// shape field lives in — (origin.x, origin.y, size.x, size.y). The
+    /// identity (0, 0, 1, 1) maps the shape space onto the whole surface
+    /// (and is the default). Every silhouette, refraction normal and bevel
+    /// is evaluated in this space: the shape region is what gets drawn.
+    pub shape_region: [f32; 4],
+    /// The surface's own shape: (kind, superellipse exponent, 0, 0).
+    /// Kind 0 = rounded rect / stadium (radius from `capsule_radius`),
+    /// kind 1 = superellipse.
+    pub shape_meta: [f32; 4],
 }
 
 /// Configurable reveal animation, reusable by any liquid glass surface.
@@ -176,8 +191,33 @@ impl Default for GlassShaderParams {
             vibrancy: 0.69,
             vibrancy_saturation: 0.44,
             rim_shadow_strength: 0.35,
-            vibrancy_padding: [0.0; 1],
+            cbuffer_align: [0.0; 1],
+            // Identity shape region: the shape space spans the surface.
+            shape_region: [0.0, 0.0, 1.0, 1.0],
+            // Own shape: rounded rect (kind 0); the superellipse exponent
+            // default (2.0) is inert for the rounded kind.
+            shape_meta: [0.0, 2.0, 0.0, 0.0],
         }
+    }
+}
+
+/// The silhouette a glass surface draws — the shape engine's presets. Each
+/// surface picks one preset: its field is the drawn, refracted and beveled
+/// region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GlassShape {
+    /// Rounded rectangle / stadium — the classic pill. The corner radius
+    /// comes from `GlassConfig::corner_radius_px` (0 = square corners, half
+    /// the surface height = a full capsule/circle).
+    Rounded,
+    /// Superellipse (squircle): |x/a|^n + |y/b|^n = 1. `exponent` 2 is an
+    /// ellipse, 4..6 the iOS-style squircle, higher approaches a box.
+    Superellipse { exponent: f32 },
+}
+
+impl Default for GlassShape {
+    fn default() -> Self {
+        Self::Rounded
     }
 }
 
@@ -433,11 +473,15 @@ pub enum SurfacePlacement {
 /// Creation-time options for a [`crate::GlassSurface`].
 #[derive(Clone, Debug)]
 pub struct GlassConfig {
-    /// Pill corner radius in surface pixels, applied inside the shader's SDF
-    /// so the edge stays antialiased through the composition alpha. Any
+    /// Pill corner radius in surface pixels, applied inside the shader's
+    /// SDF so the edge stays antialiased through the composition alpha. Any
     /// radius is allowed (not just full capsules); `0.0` produces square
-    /// corners.
+    /// corners. The radius of the [`GlassShape::Rounded`] preset.
     pub corner_radius_px: f32,
+    /// The shape engine preset this surface draws (rounded rect by
+    /// default; `GlassShape::Superellipse` for squircles). The radius of
+    /// the rounded preset is `corner_radius_px`.
+    pub shape: GlassShape,
     /// Which part of the host window the surface covers.
     pub surface_anchor: SurfaceAnchor,
     /// Apply borderless styling (`configure_borderless_host`) to the host
@@ -464,6 +508,7 @@ impl Default for GlassConfig {
     fn default() -> Self {
         Self {
             corner_radius_px: 0.0,
+            shape: GlassShape::default(),
             surface_anchor: SurfaceAnchor::default(),
             style_host_window: true,
             shader: GlassShaderParams::default(),

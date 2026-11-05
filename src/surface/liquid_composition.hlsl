@@ -70,8 +70,19 @@ cbuffer GlassParams : register(b1) {
     // Strength of the rim's inner contact shadow on the side turned away
     // from the light (0 disables it).
     float rimShadowStrength;
-    // Layout parity with GlassShaderParams' reserved padding.
-    float vibrancyPadding;
+    // Alignment filler: a float4 packs to the next 16-byte register, so the
+    // following rows must start on one (parity with cbuffer_align).
+    float cbufferAlign;
+    // ---- The shape engine ----
+    // The SHAPE REGION: the rect (in surface uv, origin top-left) the
+    // shape field lives in. Identity maps the shape space onto the whole
+    // surface. Every silhouette, refraction normal and bevel is evaluated
+    // in this space: the shape region is what gets drawn.
+    float4 shapeRegion;
+    // The surface's own shape preset: (kind, superellipse exponent, 0, 0).
+    // Kind 0 = rounded rect / stadium (radius from capsuleRadius), kind 1
+    // = superellipse.
+    float4 shapeMeta;
 };
 
 // Geometry of the Kawase chain's crop region, uploaded by the compositor
@@ -161,20 +172,23 @@ float fbmLite(float2 p) {
     return valueNoise(p) * 0.9;
 }
 
-// Rounded-rect signed distance for a point in capsule space.
-float roundedRectSd(float2 position, float aspect, float radius) {
-    const float2 bounds = float2(aspect * 0.5 - radius, 0.5 - radius);
-    const float2 q = abs(position) - bounds;
+// ---- The shape engine ----
+// Every silhouette is one of the presets below, evaluated in the shape
+// region's local units (1 unit = the region's height; +x right, +y down).
+// The preset defines exactly what gets drawn, refracted and beveled.
+
+// Rounded rectangle / stadium signed distance with explicit half-extents
+// (the radius comes off the extents, so radius = half the smaller extent
+// is a capsule/circle and 0 is a square).
+float roundedBoxSd(float2 position, float2 halfExtents, float radius) {
+    const float2 q = abs(position) - (halfExtents - radius);
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
 }
 
-// The rounded-rect SDF's own gradient: the outward normal of the edge the
-// point is nearest. Perpendicular to a straight edge everywhere, turning
-// radial only on the rounded end caps — unlike a center-out direction,
-// which on a wide pill runs nearly parallel to the long edges.
-float2 roundedRectNormal(float2 position, float aspect, float radius) {
-    const float2 bounds = float2(aspect * 0.5 - radius, 0.5 - radius);
-    const float2 q = abs(position) - bounds;
+// The rounded box's outward normal (same mechanics as before, around the
+// shape's own center).
+float2 roundedBoxNormal(float2 position, float2 halfExtents, float radius) {
+    const float2 q = abs(position) - (halfExtents - radius);
     if (q.x > 0.0 && q.y > 0.0) {
         return normalize(sign(position) * q);
     }
@@ -182,6 +196,50 @@ float2 roundedRectNormal(float2 position, float aspect, float radius) {
         return float2(sign(position.x), 0.0);
     }
     return float2(0.0, sign(position.y));
+}
+
+// Superellipse (squircle) pseudo-SDF: f(p) = ||p / halfExtents||_n - 1 is
+// negative inside and zero on the boundary, and the first-order distance
+// approximation f / |∇f| has the exact boundary slope — which is all the
+// AA band, the refraction fall-off and the bevel need. (An exact SDF for
+// a superellipse has no closed form; this approximation is the standard
+// one and is visually indistinguishable at these band widths.)
+float superellipseSd(float2 position, float2 halfExtents, float exponent) {
+    const float n = max(exponent, 1.0);
+    const float2 safe = max(halfExtents, 1e-5);
+    const float2 q = abs(position) / safe;
+    const float g = pow(q.x, n) + pow(q.y, n);
+    const float f = pow(max(g, 0.0), 1.0 / n) - 1.0;
+    const float common = pow(max(g, 1e-6), 1.0 / n - 1.0);
+    const float2 gradient = common * float2(
+        sign(position.x) * pow(q.x, n - 1.0) / safe.x,
+        sign(position.y) * pow(q.y, n - 1.0) / safe.y);
+    return f / max(length(gradient), 1e-6);
+}
+
+// The superellipse's outward normal (the implicit function's gradient).
+float2 superellipseNormal(float2 position, float2 halfExtents, float exponent) {
+    const float n = max(exponent, 1.0);
+    const float2 safe = max(halfExtents, 1e-5);
+    const float2 q = abs(position) / safe;
+    const float g = max(pow(q.x, n) + pow(q.y, n), 1e-6);
+    const float common = pow(g, 1.0 / n - 1.0);
+    return normalize(common * float2(
+        sign(position.x) * pow(q.x, n - 1.0) / safe.x,
+        sign(position.y) * pow(q.y, n - 1.0) / safe.y) + 1e-6);
+}
+
+// Shape-preset dispatch (kind 0 = rounded box, 1 = superellipse).
+float shapeFieldSd(float2 position, float2 halfExtents, float radius, float kind, float exponent) {
+    return kind < 0.5
+        ? roundedBoxSd(position, halfExtents, radius)
+        : superellipseSd(position, halfExtents, exponent);
+}
+
+float2 shapeFieldNormal(float2 position, float2 halfExtents, float radius, float kind, float exponent) {
+    return kind < 0.5
+        ? roundedBoxNormal(position, halfExtents, radius)
+        : superellipseNormal(position, halfExtents, exponent);
 }
 
 // The composite body, shared by both shader variants. `lite` is a literal
@@ -205,9 +263,18 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // monitor's aspect ratio into the shape.
     const float surfaceWidthPx = sourceUvSize.x / captureTexelUv.x;
     const float surfaceHeightPx = sourceUvSize.y / captureTexelUv.y;
-    const float aspect = surfaceWidthPx / surfaceHeightPx;
     const float2 baseUv = sourceUvOrigin + input.uv * sourceUvSize;
-    const float2 capsulePosition = (input.uv - 0.5) * float2(aspect, 1.0);
+    // ---- The shape engine's space ----
+    // The shape field lives in the SHAPE REGION (a uv sub-rect of the
+    // surface; identity spans the whole surface). All silhouette math —
+    // the own shape and the reveal warp — is evaluated here, in units of
+    // the region's own height, so the anchored surface rect can be larger
+    // (re-anchor slack) without ever rescaling a shape.
+    const float shapeHeightPx = max(shapeRegion.w, 1e-5) * surfaceHeightPx;
+    const float shapeAspect = (shapeRegion.z * surfaceWidthPx)
+        / max(shapeRegion.w * surfaceHeightPx, 1e-5);
+    const float2 shapePosition = ((input.uv - shapeRegion.xy)
+        / max(shapeRegion.zw, 1e-5) - 0.5) * float2(shapeAspect, 1.0);
     // Scale the glass shape uniformly around its bottom-center so the reveal
     // can grow the pill from slightly smaller, with anisotropic squash and
     // stretch on top (the resize spring). Scaling the position (rather than
@@ -215,10 +282,14 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // reveal warp — consistent with the scaled shape.
     const float2 scaleOrigin = float2(0.0, 0.5);
     const float2 pillScaleVec = float2(pillScale * pillScaleX, pillScale * pillScaleY);
-    const float2 scaledPosition = (capsulePosition - scaleOrigin) / pillScaleVec + scaleOrigin;
-    // Standard rounded-rect signed distance (valid for both rounded rects
-    // and stadiums, where the y bounds collapse to zero).
-    const float roundedRectDistance = roundedRectSd(scaledPosition, aspect, capsuleRadius);
+    const float2 scaledPosition = (shapePosition - scaleOrigin) / pillScaleVec + scaleOrigin;
+    const float2 shapeHalfExtents = float2(shapeAspect, 1.0) * 0.5;
+    // The surface's own shape preset (rounded rect by default; the shape
+    // engine's superellipse when shapeMeta selects it).
+    const float ownDistance = shapeFieldSd(
+        scaledPosition, shapeHalfExtents, capsuleRadius, shapeMeta.x, shapeMeta.y);
+    const float2 ownNormal = shapeFieldNormal(
+        scaledPosition, shapeHalfExtents, capsuleRadius, shapeMeta.x, shapeMeta.y);
     // Reveal: the glass bubbles out of its origin point and grows into the
     // full shape. Three ingredients build the liquid feel:
     //   1. a noise-lobed blob expanding from the origin — liquid mass that
@@ -247,7 +318,7 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     float2 revealWarp = float2(0.0, 0.0);
     if (revealEnergy > 0.0015) {
         const float2 revealOriginPx = float2(
-            (revealOrigin.x - 0.5) * aspect,
+            (revealOrigin.x - 0.5) * shapeAspect,
             revealOrigin.y - 0.5
         );
         const float2 revealRelative = scaledPosition - revealOriginPx;
@@ -256,7 +327,7 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
         // the growing boundary sweeps through a fixed noise field.
         const float turbulenceFrequency = turbulenceScale * 3.5;
         const float lobeAmplitude =
-            (turbulenceStrength / surfaceHeightPx) * revealEnergy * 0.8;
+            (turbulenceStrength / shapeHeightPx) * revealEnergy * 0.8;
         const float2 lobeUv = scaledPosition * turbulenceFrequency * 1.7
             + float2(animationTime * 1.1, animationTime * 0.7);
         lobe = ((lite ? fbmLite(lobeUv) : fbm(lobeUv)) - 0.5) * lobeAmplitude;
@@ -316,23 +387,25 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // completes; its rim gets the same turbulence lobes.
     const float revealScale = max(shapeEased, 0.02);
     const float2 revealOriginPx = float2(
-        (revealOrigin.x - 0.5) * aspect,
+        (revealOrigin.x - 0.5) * shapeAspect,
         revealOrigin.y - 0.5
     );
     const float2 revealedPosition =
         (scaledPosition - revealOriginPx) / revealScale + revealOriginPx;
-    const float scaledSd = roundedRectSd(revealedPosition, aspect, capsuleRadius) - lobe;
+    const float scaledSd = shapeFieldSd(
+        revealedPosition, shapeHalfExtents, capsuleRadius, shapeMeta.x, shapeMeta.y) - lobe;
     // Intersecting with the unscaled rounded rect keeps the animation from
     // ever spilling outside the surface's final bounds.
     const float revealShape = min(min(scaledSd, fadeBlobSd), fadeBubblesSd);
-    const float signedDistance = max(revealShape, roundedRectDistance);
+    const float shapeDistance = ownDistance;
+    const float signedDistance = max(revealShape, shapeDistance);
     const float revealMask = smoothstep(0.0, 0.1, eased);
     // Shape coverage. The AA softness is clamped to a constant ~1.25px: a
     // normalized softness stretches the silhouette fringe (and the outline's
     // white riding it) in proportion to the surface height, which made the
     // rim read soft and fat on large containers and crisp on small ones.
-    const float edgeSoftness = min(pillSoftness, 1.25 / surfaceHeightPx);
-    const float pillMask =
+    const float edgeSoftness = min(pillSoftness, 1.25 / shapeHeightPx);
+    float silhouetteMask =
         (1.0 - smoothstep(0.0, edgeSoftness, signedDistance))
         * lerp(revealMask, revealAlpha, glassFade);
     const float distanceToBorder = max(-signedDistance, 0.0);
@@ -344,7 +417,7 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // Refraction follows the true edge normal: content near an edge is
     // stretched straight away from that edge (magnifying toward the rim),
     // fading to zero displacement toward the center via edgeStrength.
-    const float2 edgeNormal = roundedRectNormal(scaledPosition, aspect, capsuleRadius);
+    const float2 edgeNormal = ownNormal;
     float2 displacement = edgeNormal * texel * refractionStrength * edgeStrength;
     displacement += pointerVelocity * texel * pointerInfluence * edgeStrength;
     displacement += revealWarp;
@@ -399,7 +472,7 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // which slides slightly down the slope on oblique edges. The light is
     // added over the glass (never blended toward flat white), so it reads as
     // illumination landing on the surface rather than a drawn border line.
-    const float signedDistancePx = signedDistance * surfaceHeightPx;
+    const float signedDistancePx = signedDistance * shapeHeightPx;
     const float distanceToBorderPx = max(-signedDistancePx, 0.0);
     const float lightAngle = radians(outlineAngleDegrees);
     const float2 lightDir = float2(cos(lightAngle), sin(lightAngle));
@@ -419,19 +492,22 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
         sqrt(max(2.0 * bevelU - bevelU * bevelU, 0.0)));
     // The border point facing the light: the corner-circle center in the
     // light's quadrant, pushed out along the light direction onto the rim.
-    const float2 capsuleBounds = float2(aspect * 0.5 - capsuleRadius, 0.5 - capsuleRadius);
+    const float2 capsuleBounds = shapeHalfExtents - capsuleRadius;
     const float2 anchor = sign(lightDir) * capsuleBounds + lightDir * capsuleRadius;
     // Fade distance along the border from the lit corner. Auto = a quarter
     // of the half-perimeter, so the same share of the border is lit on any
     // surface size; an explicit pixel fade is capped there so the front and
     // mirrored lobes can never overlap and sum into double brightness on
     // small surfaces.
-    const float autoFadePx = (surfaceWidthPx + surfaceHeightPx) * 0.25;
+    const float shapeWidthPx = shapeHeightPx * shapeAspect;
+    const float autoFadePx = (shapeWidthPx + shapeHeightPx) * 0.25;
+    // A NEGATIVE outlineFadePx disables the corner-anchor fade entirely:
+    // every border point responds to the light by its own bevel normal.
     const float fadePx = outlineFadePx > 0.0
         ? min(outlineFadePx, autoFadePx)
-        : autoFadePx;
-    const float frontFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition - anchor) * surfaceHeightPx);
-    const float backFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition + anchor) * surfaceHeightPx);
+        : (outlineFadePx < 0.0 ? 1e5 : autoFadePx);
+    const float frontFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition - anchor) * shapeHeightPx);
+    const float backFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition + anchor) * shapeHeightPx);
     // The polish: a tight specular glint over a soft broad sheen. The glint
     // carries the "light catching the ridge" read; the sheen keeps the whole
     // lit slope visibly raised between glints.
@@ -465,8 +541,10 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     const float3 shaded = bordered * (1.0 - rimShadow) + rimLight;
     // The SDF controls coverage and distortion only; it never adds an edge
     // color. The composition swap chain expects premultiplied alpha, so the
-    // color is scaled by the capsule coverage for smooth antialiased edges.
-    return float4(saturate(shaded) * pillMask, pillMask);
+    // color is scaled by the silhouette coverage for smooth antialiased
+    // edges.
+    const float coverage = silhouetteMask;
+    return float4(saturate(shaded) * coverage, coverage);
 }
 
 float4 ps_main(VertexOutput input) : SV_Target {

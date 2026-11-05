@@ -17,7 +17,8 @@ use super::window::{
 use super::SharedCompositor;
 use crate::backdrop::SurfaceRoute;
 use crate::params::{
-    BackdropSource, GlassConfig, GlassShaderParams, RevealAnimation, SurfaceAnchor,
+    BackdropSource, GlassConfig, GlassShape, GlassShaderParams, RevealAnimation,
+    SurfaceAnchor,
 };
 use crate::shared::engine;
 
@@ -38,6 +39,13 @@ pub struct GlassSurface {
     compositor: SharedCompositor,
     shader_params: GlassShaderParams,
     corner_radius_px: f32,
+    /// The surface's own shape preset (the shape engine's rounded rect /
+    /// superellipse). Drives the shader's silhouette, refraction normals
+    /// and bevel.
+    shape: GlassShape,
+    /// The shape region: the rect (in surface uv, origin top-left) the
+    /// shape field lives in. Identity spans the whole surface.
+    shape_region: [f32; 4],
     surface_anchor: SurfaceAnchor,
     surface_height_px: f32,
     style_host_window: bool,
@@ -107,6 +115,8 @@ impl GlassSurface {
             compositor,
             shader_params: config.shader,
             corner_radius_px: config.corner_radius_px,
+            shape: config.shape,
+            shape_region: [0.0, 0.0, 1.0, 1.0],
             surface_anchor: config.surface_anchor,
             surface_height_px: height(&bounds)? as f32,
             style_host_window: config.style_host_window,
@@ -180,16 +190,12 @@ impl GlassSurface {
     }
 
     /// Replaces every shader float live; takes effect on the next frame.
+    /// The surface's own shape stamp (shape region + shape preset) rides on
+    /// top, so a settings push never clobbers the surface's shape state.
     pub fn set_shader_params(&mut self, mut params: GlassShaderParams) -> Result<(), String> {
         params = scale_texel_params(params, engine().capture_scale());
-        self.with_context(|context| {
-            self.compositor
-                .lock()
-                .expect("D3D11 compositor lock poisoned")
-                .set_params(context, params)
-        })?;
         self.shader_params = params;
-        Ok(())
+        self.upload_params()
     }
     /// Like [`GlassSurface::set_shader_params`], but keeps the surface's own corner radius:
     /// shared settings applied to several surfaces won't distort their shapes.
@@ -233,12 +239,41 @@ impl GlassSurface {
         self.corner_radius_px = corner_radius_px;
         let radius_units = (corner_radius_px / self.surface_height_px.max(1.0)).clamp(0.0, 0.5);
         self.shader_params.capsule_radius = radius_units;
+        self.upload_params()
+    }
+
+    /// Changes the surface's own shape preset (the shape engine's rounded
+    /// rect / superellipse). The rounded kind keeps the surface's corner
+    /// radius; the superellipse's exponent comes from the preset.
+    pub fn set_shape(&mut self, shape: GlassShape) -> Result<(), String> {
+        if shape == self.shape {
+            return Ok(());
+        }
+        self.shape = shape;
+        self.upload_params()
+    }
+
+    /// Uploads the stored shader params (the compositor no-ops when nothing
+    /// changed).
+    fn upload_params(&mut self) -> Result<(), String> {
+        let mut params = self.shader_params;
+        self.stamp_shape(&mut params);
         self.with_context(|context| {
             self.compositor
                 .lock()
                 .expect("D3D11 compositor lock poisoned")
-                .set_params(context, self.shader_params)
+                .set_params(context, params)
         })
+    }
+
+    /// Writes the surface's shape state into a params copy (the cbuffer's
+    /// shape rows: the shape region and the own shape preset).
+    fn stamp_shape(&self, params: &mut GlassShaderParams) {
+        params.shape_region = self.shape_region;
+        params.shape_meta = match self.shape {
+            GlassShape::Rounded => [0.0, 2.0, 0.0, 0.0],
+            GlassShape::Superellipse { exponent } => [1.0, exponent.max(1.0), 0.0, 0.0],
+        };
     }
 
     /// Starts (or reverses) the reveal animation for this surface.

@@ -117,6 +117,16 @@ pub(crate) struct BrokerClient {
 // thread — the same confinement as the existing compositors.
 unsafe impl Send for BrokerClient {}
 
+impl Drop for BrokerClient {
+    fn drop(&mut self) {
+        // A clean engine shutdown (the render loop ending) must release
+        // the consumer slot just like a failure path does: the slot is
+        // otherwise pinned by the live pid and the broker never notices
+        // that this app stopped using it.
+        self.release_registration();
+    }
+}
+
 impl BrokerClient {
     pub(crate) fn new() -> Self {
         Self {
@@ -359,9 +369,20 @@ impl BrokerClient {
         {
             self.last_probe = Some(now);
             let broker_pid = manifest.broker_pid.load(Ordering::Acquire);
+            // The probe handle must be closed: an open handle leaked every
+            // second pinned the broker's process object forever.
             let alive = broker_pid != 0
-                && unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, broker_pid) }
-                    .is_ok();
+                && match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, broker_pid) }
+                {
+                    Ok(handle) => {
+                        let valid = !handle.is_invalid();
+                        unsafe {
+                            let _ = CloseHandle(handle);
+                        }
+                        valid
+                    }
+                    Err(_) => false,
+                };
             if !alive {
                 let reason = "The glass broker process exited".to_owned();
                 return Err(self.detach(reason));
@@ -502,6 +523,21 @@ impl BrokerClient {
     /// caller surfaces it): the slot is released and every mapped
     /// resource dropped, resetting the machine to `Idle`.
     fn detach(&mut self, reason: String) -> String {
+        self.release_registration();
+        self.mapped = None;
+        self.private = None;
+        self.phase = Phase::Idle;
+        self.last_version = 0;
+        self.last_active = false;
+        self.last_probe = None;
+        reason
+    }
+
+    /// Releases this process's consumer slot and view (shared by `detach`
+    /// and `Drop`). Without this, an app that shuts its engine down
+    /// cleanly — no error path taken — would keep its slot registered
+    /// until the process itself exits, pinning the broker open.
+    fn release_registration(&mut self) {
         if let Some(view) = self.view.as_ref() {
             let slot = match self.phase {
                 Phase::Registered { slot, .. } | Phase::Attached { slot } => Some(slot),
@@ -521,13 +557,6 @@ impl BrokerClient {
             }
         }
         self.view = None;
-        self.mapped = None;
-        self.private = None;
-        self.phase = Phase::Idle;
-        self.last_version = 0;
-        self.last_active = false;
-        self.last_probe = None;
-        reason
     }
 
     /// Auto-start: launches the broker binary, searching (in order) the

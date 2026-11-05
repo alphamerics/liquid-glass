@@ -789,6 +789,19 @@ impl D3D11Compositor {
         .map_err(|error| format!("Could not resize the D3D11 swap chain: {error}"))?;
         self.width = width;
         self.height = height;
+        // A resized composition swap chain's buffers are UNINITIALIZED:
+        // DWM composites garbage (a black box) until the next present —
+        // visible as a black flash on every resize of visible glass. Clear
+        // and present one fully transparent frame immediately, so the
+        // window never shows the reallocated buffers' contents.
+        let (_, target) = self.back_buffer_view(context)?;
+        unsafe {
+            context.ClearRenderTargetView(&target, &[0.0, 0.0, 0.0, 0.0]);
+            self.swap_chain
+                .Present(0, DXGI_PRESENT(0))
+                .ok()
+                .map_err(|error| format!("Could not present the resize clear frame: {error}"))?;
+        }
         Ok(())
     }
 
