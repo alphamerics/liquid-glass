@@ -1,16 +1,5 @@
-//! The shared Windows Graphics Capture feed.
-//!
-//! ONE session for every glass host in the process (the in-process engine
-//! or the broker): frames arrive scaled down to `CAPTURE_SCALE` of the
-//! monitor (the frame pool is simply created at the smaller size — WGC
-//! scales the content), and the newest frame is copied into a single
-//! stable texture that the host's render loop samples. The callback does
-//! no rendering; it only refreshes the shared texture and bumps the
-//! version counter.
-//!
-//! The feed is generic over its host through [`FrameHost`]: the library's
-//! engine (`EngineState`) and the broker's publisher (`BrokerHost`) both
-//! implement it, so both drive the exact same pipeline.
+//! The monitor capture session: pool creation, the frame-arrived callback
+//! (dirty-region skips, rate caps, the stable-texture copy) and teardown.
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -23,59 +12,21 @@ use windows::{
     Foundation::TimeSpan,
     Graphics::{
         Capture::{
-            Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem,
+            Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode,
             GraphicsCaptureSession,
         },
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
-        SizeInt32,
     },
-    Win32::{
-        Foundation::POINT,
-        Graphics::{
-            Direct3D11::{
-                ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-                D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-            },
-            Dxgi::IDXGIDevice,
-            Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY},
-        },
-        System::WinRT::{
-            Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
-            Graphics::Capture::IGraphicsCaptureItemInterop,
-        },
+    Win32::Graphics::{
+        Direct3D11::ID3D11Texture2D,
+        Dxgi::IDXGIDevice,
     },
+    Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
 };
 
-use crate::shared::CAPTURE_SCALE;
-
-const FRAME_POOL_BUFFERS: i32 = 2;
-
-/// The capture host's delivery interface: the feed copies each fresh
-/// frame into the host's texture and asks the host who is actively
-/// rendering (parked glass suppresses the copy entirely).
-pub(crate) trait FrameHost: Send {
-    /// The device all feed textures must be created on.
-    fn device(&self) -> &ID3D11Device;
-    /// Delivers the stable texture + shader view for the current pool
-    /// size (also bumps the host's frame version).
-    fn set_frame(&mut self, frame: (ID3D11Texture2D, ID3D11ShaderResourceView), size: SizeInt32);
-    /// The stable texture to copy frames into, if one exists yet.
-    fn frame_texture(&self) -> Option<&ID3D11Texture2D>;
-    /// The immediate context clone for the callback's `CopyResource`
-    /// (contexts are not `Send`, so the trait tunnels a clone out from
-    /// behind the host's mutex).
-    fn copy_context(&self) -> ID3D11DeviceContext;
-    /// The scaled size the pool and texture were created at.
-    fn frame_size(&self) -> SizeInt32;
-    /// Whether any consumer of this host is actively rendering (windows
-    /// visible); `false` lets the feed skip its per-frame GPU blit.
-    fn any_active(&self) -> bool;
-    /// Whether a frame copy may run now (the host owns the quality
-    /// tier's backdrop rate cap). Returns `true` and stamps the copy
-    /// time when the copy is allowed.
-    fn capture_due(&mut self) -> bool;
-}
-
+use super::frame::{create_frame_texture, scale_size};
+use super::{FrameHost, FRAME_POOL_BUFFERS};
+use super::monitor::{primary_monitor_item, request_borderless_capture};
 /// `CreateDirect3D11DeviceFromDXGIDevice` produces an agile WinRT wrapper
 /// around our free-threaded D3D11 device. windows-rs does not mark this
 /// particular WinRT interface as `Send`, though WGC invokes its free-threaded
@@ -294,80 +245,4 @@ impl Drop for CaptureFeed {
         let _ = self.session.Close();
         let _ = self.frame_pool.Close();
     }
-}
-
-fn scale_size(size: SizeInt32) -> SizeInt32 {
-    SizeInt32 {
-        Width: ((size.Width as f32 * CAPTURE_SCALE).round() as i32).max(1),
-        Height: ((size.Height as f32 * CAPTURE_SCALE).round() as i32).max(1),
-    }
-}
-
-/// The shared capture frame texture plus its shader view, created together:
-/// every consumer samples the same view for the texture's whole lifetime
-/// (recreated only when the monitor's size changes).
-pub(crate) fn create_frame_texture(
-    device: &ID3D11Device,
-    size: SizeInt32,
-) -> (ID3D11Texture2D, ID3D11ShaderResourceView) {
-    let mut texture = None;
-    unsafe {
-        device.CreateTexture2D(
-            &D3D11_TEXTURE2D_DESC {
-                Width: size.Width as u32,
-                Height: size.Height as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            },
-            None,
-            Some(&mut texture),
-        )
-    }
-    .map_err(|error| format!("Could not create the shared capture frame texture: {error}"))
-    .expect("Could not create the shared capture frame texture");
-    let texture = texture.expect("D3D11 shared capture frame texture missing");
-    let mut view = None;
-    unsafe {
-        device
-            .CreateShaderResourceView(&texture, None, Some(&mut view))
-            .expect("Could not create the shared capture frame view");
-    }
-    (
-        texture,
-        view.expect("D3D11 shared capture frame view missing"),
-    )
-}
-
-fn primary_monitor_item() -> Result<GraphicsCaptureItem, String> {
-    let monitor = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
-    if monitor.0.is_null() {
-        return Err("Could not locate the primary monitor".to_owned());
-    }
-    let interop: IGraphicsCaptureItemInterop =
-        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(
-            |error| format!("Could not obtain the GraphicsCaptureItem interop factory: {error}"),
-        )?;
-    unsafe {
-        interop
-            .CreateForMonitor(monitor)
-            .map_err(|error| format!("Could not create the primary-monitor capture item: {error}"))
-    }
-}
-
-/// Windows 11: grants the borderless-capture permission so
-/// GraphicsCaptureSession::SetBorderRequired(false) is accepted. Requires the
-/// packaged graphicsCaptureProgrammatic capability; no-op elsewhere.
-fn request_borderless_capture() {
-    use windows::Graphics::Capture::{GraphicsCaptureAccess, GraphicsCaptureAccessKind};
-    let _ = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
-        .and_then(|operation| operation.get());
 }

@@ -79,10 +79,38 @@ cbuffer GlassParams : register(b1) {
     // surface. Every silhouette, refraction normal and bevel is evaluated
     // in this space: the shape region is what gets drawn.
     float4 shapeRegion;
-    // The surface's own shape preset: (kind, superellipse exponent, 0, 0).
-    // Kind 0 = rounded rect / stadium (radius from capsuleRadius), kind 1
-    // = superellipse.
+    // The SHAPE TRANSFORM: an additional animated scale + translation on
+    // top of the shape region — (scale_x, scale_y, offset_x, offset_y) in
+    // shape-region units. Scale is anchored to the shape's bottom-center
+    // (the same anchor pillScale uses) and composes with it
+    // multiplicatively; the offset positions the shape's anchor point.
+    // (1, 1, 0, 0) is the identity. A host animates the drawn shape's size
+    // and position with this — one constant-buffer update per frame, no
+    // window or swap-chain resizes.
+    float4 shapeTransform;
+    // The surface's own shape preset: (kind, superellipse exponent, ball
+    // count, tension exponent). Kind 0 = rounded rect / stadium (radius
+    // from capsuleRadius), kind 1 = superellipse, kind 2 = the metaball
+    // field below (then .z carries the active ball count and .w the
+    // field's tension exponent).
     float4 shapeMeta;
+    // ---- The metaball field (kind 2) ----
+    // Up to six balls, each (cx, cy, radius, weight) in shape-region units
+    // (the same space revealOrigin uses: region center at the origin, +y
+    // down, one unit = the region's height). Every ball contributes
+    // weight * (radius / distance)^tension to an isopotential whose surface
+    // sits where the sum is exactly 1: isolated balls read as exact
+    // circles, nearby balls merge with the characteristic liquid neck.
+    float4 metaballs[6];
+    // Cross-surface territory clip: (own ball index, clip enabled, first
+    // foreign index, unused). When enabled, this surface renders the field
+    // only where its OWN ball's contribution is the largest among the
+    // foreign balls — several metaball surfaces sharing one field then tile
+    // the merged blob exactly, instead of each rendering all of it and
+    // double-compositing the overlap into straight-edge seams. The
+    // contribution is canvas-independent (the region height cancels), so
+    // the territories agree across surfaces of any canvas size.
+    float4 metaballOwn;
 };
 
 // Geometry of the Kawase chain's crop region, uploaded by the compositor
@@ -177,6 +205,45 @@ float fbmLite(float2 p) {
 // region's local units (1 unit = the region's height; +x right, +y down).
 // The preset defines exactly what gets drawn, refracted and beveled.
 
+// Floor on the metaball field's first-order distance gradient (shape
+// units): near the isosurface |∇f| is ~1 (exact boundary slope), but the
+// field flattens toward merge saddles and the estimate explodes as
+// f / |∇f|. The floor bounds that explosion; the ball disks' own circle
+// distances own the regions it bites (see metaballFieldSd).
+#define METABALL_GRADIENT_FLOOR 0.3
+
+// Margin (shape units) past the metaball field's bounding disc beyond which
+// the field loop is skipped entirely. Every downstream consumer of the
+// distance outside the silhouette depends on its sign alone EXCEPT the AA
+// band, whose width is clamped to ~1.25px (= 1.25/shapeHeightPx in shape
+// units, below this margin for any surface taller than 5px) — so the bound
+// distance, a lower bound of the true distance, produces identical output.
+#define METABALL_BOUND_MARGIN 0.25
+
+// Per-ball influence falloff, in multiples of the ball's own radius: a
+// ball's contribution rides a smooth window that is exactly 1 inside the
+// start distance and fades to 0 by the end distance. Past the start
+// distance a ball stops pulling other balls' halves of the field toward
+// it, so heavily separated balls each stay round circles instead of
+// stretching a thin neck across the gap — the merge only happens once
+// two balls' reach windows overlap strongly. Because the window scales
+// with the ball's own radius, the faded contribution stays
+// canvas-independent exactly like the raw one (the territory clip's
+// cross-surface agreement is preserved). The window is 1 wherever a
+// contribution of 1 is reachable (an isolated ball surfaces at exactly
+// one radius from its center), so single balls still read as exact
+// circles through the falloff.
+//
+// The start sits right at one radius — the exact surface of an isolated
+// ball — so the window engages immediately beyond a ball's own rim: a
+// neighbour's pull is gone by two radii out, which is what keeps the
+// balls round until they are nearly touching (the classic isopotential
+// alone would bulge and bridge them from ~2.8 radii apart). The merge
+// threshold lands at ~2.5 radii center-to-center: separate circles with
+// a visible gap, a brief liquid neck, then one blob.
+#define METABALL_FALLOFF_START 1.0
+#define METABALL_FALLOFF_END 2.0
+
 // Rounded rectangle / stadium signed distance with explicit half-extents
 // (the radius comes off the extents, so radius = half the smaller extent
 // is a capsule/circle and 0 is a square).
@@ -229,17 +296,167 @@ float2 superellipseNormal(float2 position, float2 halfExtents, float exponent) {
         sign(position.y) * pow(q.y, n - 1.0) / safe.y) + 1e-6);
 }
 
-// Shape-preset dispatch (kind 0 = rounded box, 1 = superellipse).
-float shapeFieldSd(float2 position, float2 halfExtents, float radius, float kind, float exponent) {
-    return kind < 0.5
-        ? roundedBoxSd(position, halfExtents, radius)
-        : superellipseSd(position, halfExtents, exponent);
+// Metaball field (kind 2): the classic inverse-square isopotential,
+// generalized by a tension exponent n. Ball i contributes
+// (rᵢ·wᵢ^(1/n) / |p - cᵢ|)ⁿ to the potential — the effective radius
+// rᵢ·wᵢ^(1/n) arrives PRECOMPUTED from the CPU in the row's z slot — and
+// the surface sits where the sum is exactly 1. An isolated ball (weight 1)
+// is the exact circle of its radius; nearby balls merge with the
+// characteristic liquid neck (higher tension merges tighter and rounder,
+// lower tension stretches long threads). On top of the isopotential,
+// every ball's influence carries a distance falloff (see the
+// METABALL_FALLOFF_* defines): its contribution dies out by a couple of
+// the ball's own radii, so separated balls stop interacting instead of
+// bulging and pulling at each other from across the gap.
+//
+// The distance estimate stitches two regimes:
+//   - ON and outside the isosurface, the first-order distance
+//     f / |∇f| (the superellipse's trick) is smooth with the exact
+//     boundary slope — the AA band, refraction and bevel live here.
+//   - Strictly inside, the potential is singular at the ball centers and
+//     its first-order distance collapses back toward zero (a shallow
+//     read that would light blob centers like rim crests) and blows up
+//     at symmetric merge saddles. There the estimate falls to the
+//     nearest ball's own circle distance: every ball's disk lies strictly
+//     inside the blob, so that distance is a valid metric interior depth
+//     whose zero contour can never reach the silhouette. A floor on the
+//     gradient magnitude keeps flat-field regions (merge saddles) from
+//     exploding the potential branch.
+// The min of the two keeps the potential's merge-exact boundary and the
+// disks' metric interior; the silhouette is exactly the F = 1 isosurface.
+//
+// The gradient (toward growing potential) rides out through the out
+// parameter: the fused normal dispatch reuses it instead of re-running the
+// ball loop. Callers that only want the distance leave it unused.
+float metaballFieldSd(float2 position, float4 meta, out float2 gradient) {
+    gradient = 0.0;
+    if (meta.z < 0.5) {
+        // A kind-2 shape with no balls would invert the field into an
+        // everything-interior; render nothing instead (defensive: Rust
+        // never stamps kind 2 with an empty field).
+        return 1e3;
+    }
+    const float n = max(meta.w, 1.0);
+    // Tension 2 is the classic blend and the default: a uniform fast path
+    // replaces every variable-exponent pow (an exp2+log2 pair on most
+    // GPUs) with multiplies and a square root.
+    const bool quadratic = abs(n - 2.0) < 1e-4;
+    // Bounding-disc rejection ahead of the field loop: the isosurface can
+    // never leave the union of per-ball discs inflated by count^(1/n) —
+    // outside them every contribution stays under 1/count, so the sum
+    // stays under the F = 1 isopotential. Pixels past the union's bounding
+    // circle (most of the canvas' slack padding) skip the loop entirely.
+    const float countInflation = quadratic ? sqrt(meta.z) : pow(meta.z, 1.0 / n);
+    float2 boundMin = float2(1e3, 1e3);
+    float2 boundMax = float2(-1e3, -1e3);
+    [unroll]
+    for (int probe = 0; probe < 6; probe++) {
+        if (probe >= (int)meta.z) {
+            break;
+        }
+        const float inflated = metaballs[probe].z * countInflation;
+        boundMin = min(boundMin, metaballs[probe].xy - inflated);
+        boundMax = max(boundMax, metaballs[probe].xy + inflated);
+    }
+    const float boundSd = length(position - 0.5 * (boundMin + boundMax))
+        - 0.5 * length(boundMax - boundMin);
+    if (boundSd > METABALL_BOUND_MARGIN) {
+        return boundSd;
+    }
+    float field = 0.0;
+    float nearestDisk = 1e3;
+    // The territory clip's bookkeeping: the own ball's contribution and the
+    // strongest foreign one (see metaballOwn in the cbuffer).
+    const bool clipTerritory = metaballOwn.y > 0.5;
+    const float ownIndex = metaballOwn.x;
+    const float firstForeign = metaballOwn.z;
+    float ownContribution = -1.0;
+    float maxForeignContribution = -1.0;
+    [unroll]
+    for (int ball = 0; ball < 6; ball++) {
+        if (ball >= (int)meta.z) {
+            break;
+        }
+        const float2 offset = position - metaballs[ball].xy;
+        const float dist = sqrt(dot(offset, offset) + 1e-5);
+        // The effective radius (radius * weight^(1/n)) arrives precomputed
+        // from the CPU in slot z — a per-ball constant, never per-pixel
+        // work (slot w is inert layout parity).
+        const float effectiveRadius = metaballs[ball].z;
+        const float raw = quadratic
+            ? effectiveRadius * effectiveRadius / (dist * dist)
+            : pow(effectiveRadius / dist, n);
+        // The distance falloff: influence is full inside the start
+        // distance and smoothly extinguished by the end one (both in
+        // radii of this ball — see the defines). The window's own slope
+        // is left out of the gradient below: it only bends the normal in
+        // the weak-field tail, where the field's own contribution is too
+        // small to move the silhouette.
+        const float fallStart = METABALL_FALLOFF_START * max(effectiveRadius, 1e-5);
+        const float fallEnd = METABALL_FALLOFF_END * max(effectiveRadius, 1e-5);
+        const float window = 1.0 - smoothstep(fallStart, fallEnd, dist);
+        const float contribution = raw * window;
+        field += contribution;
+        // d/dp of the windowed (r/|d|)ⁿ = -n·contribution·offset/|d|²
+        // (toward the ball, where the potential grows).
+        gradient += -n * contribution * offset / (dist * dist);
+        nearestDisk = min(nearestDisk, dist - effectiveRadius);
+        if (clipTerritory) {
+            if (ball == ownIndex) {
+                ownContribution = contribution;
+            }
+            if (ball >= firstForeign) {
+                maxForeignContribution = max(maxForeignContribution, contribution);
+            }
+        }
+    }
+    // The territory clip: a foreign ball dominating this pixel means that
+    // pixel belongs to another metaball surface's half of the merged blob.
+    // (Exact ties belong to both — a one-pixel overlap at the bisector.)
+    if (clipTerritory && maxForeignContribution > ownContribution) {
+        return 1e3;
+    }
+    const float safeField = max(field, 1e-6);
+    const float f = 1.0 - (quadratic ? sqrt(safeField) : pow(safeField, 1.0 / n));
+    const float gradientMagnitude = max(
+        length(gradient)
+            * (quadratic ? 0.5 * rsqrt(safeField) : pow(safeField, 1.0 / n - 1.0) / n),
+        METABALL_GRADIENT_FLOOR);
+    const float potentialSd = f / gradientMagnitude;
+    return min(nearestDisk, potentialSd);
 }
 
-float2 shapeFieldNormal(float2 position, float2 halfExtents, float radius, float kind, float exponent) {
-    return kind < 0.5
-        ? roundedBoxNormal(position, halfExtents, radius)
-        : superellipseNormal(position, halfExtents, exponent);
+// Shape-preset dispatch (kind 0 = rounded box, 1 = superellipse,
+// 2 = metaball field), fused: returns the signed distance and writes the
+// shape's outward normal in one pass. meta = (kind, superellipse exponent,
+// ball count, tension exponent). The metaball branch reuses the field
+// loop's gradient for its normal, so one evaluation serves both consumers
+// (the distance and the refraction/bevel normal) instead of re-running the
+// ball loop a second time.
+float shapeFieldSdNormal(float2 position, float2 halfExtents, float radius,
+                         float4 meta, out float2 normal) {
+    if (meta.x < 0.5) {
+        normal = roundedBoxNormal(position, halfExtents, radius);
+        return roundedBoxSd(position, halfExtents, radius);
+    }
+    if (meta.x < 1.5) {
+        normal = superellipseNormal(position, halfExtents, meta.y);
+        return superellipseSd(position, halfExtents, meta.y);
+    }
+    float2 gradient;
+    const float fieldDistance = metaballFieldSd(position, meta, gradient);
+    normal = meta.z < 0.5
+        ? float2(0.0, -1.0)
+        : normalize(-gradient + 1e-6);
+    return fieldDistance;
+}
+
+// Distance-only dispatch: the fused normal is computed but unused (a few
+// ALU on the analytic presets; the metaball gradient is produced by the
+// field loop either way).
+float shapeFieldSd(float2 position, float2 halfExtents, float radius, float4 meta) {
+    float2 unusedNormal;
+    return shapeFieldSdNormal(position, halfExtents, radius, meta, unusedNormal);
 }
 
 // The composite body, shared by both shader variants. `lite` is a literal
@@ -281,15 +498,25 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // the SDF result) keeps every downstream effect — refraction, outline,
     // reveal warp — consistent with the scaled shape.
     const float2 scaleOrigin = float2(0.0, 0.5);
-    const float2 pillScaleVec = float2(pillScale * pillScaleX, pillScale * pillScaleY);
-    const float2 scaledPosition = (shapePosition - scaleOrigin) / pillScaleVec + scaleOrigin;
+    // The shape transform composes on top: its scale multiplies the pill
+    // scale (both anchored at the bottom-center) and its offset positions
+    // the anchor point, expressed in shape-region units. Scaling the
+    // position AFTER folding in the offset means the offset is applied
+    // unscaled — the shape's anchor lands exactly at `scaleOrigin +
+    // shapeTransform.zw` regardless of either scale.
+    const float2 transformScale = max(shapeTransform.xy, 1e-4);
+    const float2 pillScaleVec = float2(pillScale * pillScaleX, pillScale * pillScaleY)
+        * transformScale;
+    const float2 scaledPosition = (shapePosition - shapeTransform.zw - scaleOrigin)
+        / max(pillScaleVec, 1e-4)
+        + scaleOrigin;
     const float2 shapeHalfExtents = float2(shapeAspect, 1.0) * 0.5;
     // The surface's own shape preset (rounded rect by default; the shape
-    // engine's superellipse when shapeMeta selects it).
-    const float ownDistance = shapeFieldSd(
-        scaledPosition, shapeHalfExtents, capsuleRadius, shapeMeta.x, shapeMeta.y);
-    const float2 ownNormal = shapeFieldNormal(
-        scaledPosition, shapeHalfExtents, capsuleRadius, shapeMeta.x, shapeMeta.y);
+    // engine's superellipse or metaball field when shapeMeta selects it).
+    // One fused evaluation serves both the distance and the normal.
+    float2 ownNormal;
+    const float ownDistance = shapeFieldSdNormal(
+        scaledPosition, shapeHalfExtents, capsuleRadius, shapeMeta, ownNormal);
     // Reveal: the glass bubbles out of its origin point and grows into the
     // full shape. Three ingredients build the liquid feel:
     //   1. a noise-lobed blob expanding from the origin — liquid mass that
@@ -392,8 +619,18 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     );
     const float2 revealedPosition =
         (scaledPosition - revealOriginPx) / revealScale + revealOriginPx;
-    const float scaledSd = shapeFieldSd(
-        revealedPosition, shapeHalfExtents, capsuleRadius, shapeMeta.x, shapeMeta.y) - lobe;
+    // The scaled shape's distance. Once the reveal has settled (scale 1,
+    // no lobes) `revealedPosition` IS `scaledPosition` and the `- lobe` is
+    // an identity — the exact same evaluation as `ownDistance`. The branch
+    // is uniform per frame, so a settled surface (and every content-driven
+    // frame over a static open panel) pays ONE field evaluation, not two.
+    float scaledSd;
+    if (revealScale == 1.0 && lobe == 0.0) {
+        scaledSd = ownDistance;
+    } else {
+        scaledSd = shapeFieldSd(
+            revealedPosition, shapeHalfExtents, capsuleRadius, shapeMeta) - lobe;
+    }
     // Intersecting with the unscaled rounded rect keeps the animation from
     // ever spilling outside the surface's final bounds.
     const float revealShape = min(min(scaledSd, fadeBlobSd), fadeBubblesSd);
@@ -404,7 +641,10 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     // normalized softness stretches the silhouette fringe (and the outline's
     // white riding it) in proportion to the surface height, which made the
     // rim read soft and fat on large containers and crisp on small ones.
-    const float edgeSoftness = min(pillSoftness, 1.25 / shapeHeightPx);
+    // The clamp tracks the TRANSFORMED height (the pill scale and the shape
+    // transform both shrink the drawn shape), so a scaled-down pill keeps a
+    // crisp rim instead of inheriting the full-size softness.
+    const float edgeSoftness = min(pillSoftness, 1.25 / (shapeHeightPx * pillScaleVec.y));
     float silhouetteMask =
         (1.0 - smoothstep(0.0, edgeSoftness, signedDistance))
         * lerp(revealMask, revealAlpha, glassFade);
@@ -492,20 +732,25 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
         sqrt(max(2.0 * bevelU - bevelU * bevelU, 0.0)));
     // The border point facing the light: the corner-circle center in the
     // light's quadrant, pushed out along the light direction onto the rim.
+    // Only the rect-ish presets have capsule bounds; a metaball field has
+    // no corner anchor, so its border lights by its own bevel normal
+    // everywhere (the disabled-anchor path below).
     const float2 capsuleBounds = shapeHalfExtents - capsuleRadius;
     const float2 anchor = sign(lightDir) * capsuleBounds + lightDir * capsuleRadius;
     // Fade distance along the border from the lit corner. Auto = a quarter
     // of the half-perimeter, so the same share of the border is lit on any
     // surface size; an explicit pixel fade is capped there so the front and
     // mirrored lobes can never overlap and sum into double brightness on
-    // small surfaces.
+    // small surfaces. A NEGATIVE outlineFadePx disables the corner-anchor
+    // fade entirely.
     const float shapeWidthPx = shapeHeightPx * shapeAspect;
     const float autoFadePx = (shapeWidthPx + shapeHeightPx) * 0.25;
-    // A NEGATIVE outlineFadePx disables the corner-anchor fade entirely:
-    // every border point responds to the light by its own bevel normal.
-    const float fadePx = outlineFadePx > 0.0
-        ? min(outlineFadePx, autoFadePx)
-        : (outlineFadePx < 0.0 ? 1e5 : autoFadePx);
+    const bool cornerAnchor = shapeMeta.x < 1.5;
+    const float fadePx = !cornerAnchor
+        ? 1e5
+        : outlineFadePx > 0.0
+            ? min(outlineFadePx, autoFadePx)
+            : (outlineFadePx < 0.0 ? 1e5 : autoFadePx);
     const float frontFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition - anchor) * shapeHeightPx);
     const float backFade = 1.0 - smoothstep(0.0, fadePx, length(scaledPosition + anchor) * shapeHeightPx);
     // The polish: a tight specular glint over a soft broad sheen. The glint

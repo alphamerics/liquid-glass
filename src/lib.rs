@@ -68,8 +68,8 @@ pub(crate) mod window_capture;
 
 pub use borderless::{configure_borderless_host, install_activation_subclass};
 pub use params::{
-    BackdropSource, GlassConfig, GlassShaderParams, GlassShape, Material, RevealAnimation,
-    SurfaceAnchor, SurfacePlacement,
+    BackdropSource, GlassConfig, GlassShaderParams, GlassShape, Material, MetaballField,
+    RevealAnimation, SurfaceAnchor, SurfacePlacement,
 };
 pub use quality::{QualityCaps, QualityMode};
 pub use surface::{

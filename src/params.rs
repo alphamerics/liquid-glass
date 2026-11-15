@@ -123,10 +123,47 @@ pub struct GlassShaderParams {
     /// (and is the default). Every silhouette, refraction normal and bevel
     /// is evaluated in this space: the shape region is what gets drawn.
     pub shape_region: [f32; 4],
-    /// The surface's own shape: (kind, superellipse exponent, 0, 0).
-    /// Kind 0 = rounded rect / stadium (radius from `capsule_radius`),
-    /// kind 1 = superellipse.
+    /// The SHAPE TRANSFORM: an additional animated scale + translation on
+    /// top of the shape region — (scale_x, scale_y, offset_x, offset_y) in
+    /// shape-region units (the same space the shape field and
+    /// `reveal_origin` live in). Scale is anchored to the shape's
+    /// bottom-center (the same anchor `pill_scale` uses) and composes with
+    /// it multiplicatively; the offset positions the shape's anchor point,
+    /// so `(1, 1, 0, 0)` is the identity. This is what lets a host animate
+    /// the drawn shape's size and position entirely on the GPU — a
+    /// constant-buffer update per frame, with the surface window, its swap
+    /// chain and every DOM layout untouched.
+    pub shape_transform: [f32; 4],
+    /// The surface's own shape: (kind, superellipse exponent, ball count,
+    /// tension exponent). Kind 0 = rounded rect / stadium (radius from
+    /// `capsule_radius`), kind 1 = superellipse, kind 2 = the metaball
+    /// field below (then `.z` carries the active ball count and `.w` the
+    /// field's tension exponent).
     pub shape_meta: [f32; 4],
+    /// The metaball field (kind 2): up to six balls, each
+    /// `(cx, cy, effectiveRadius, weight)` in shape-region units — the same
+    /// space `reveal_origin` lives in (origin at the region's center, +y
+    /// down, one unit = the region's height, x scaled by the region's
+    /// aspect). The compositor precomputes the effective radius
+    /// (`radius * weight^(1/tension)`, the only value the field evaluation
+    /// reads) when stamping, so the shader's per-pixel ball loop never
+    /// evaluates a pow for the weight; slot `.w` is inert layout parity.
+    /// Each ball contributes `effectiveRadius^tension / distance^tension` to
+    /// an isopotential whose surface sits exactly where the sum is 1: an
+    /// isolated ball (weight 1) reads as the exact circle of its radius,
+    /// and nearby balls merge with the characteristic liquid neck. Inert
+    /// unless the shape kind is 2; zero-weight or zero-radius balls never
+    /// contribute.
+    pub metaballs: [[f32; 4]; 6],
+    /// Cross-surface territory clip for SHARED metaball fields: (own ball
+    /// index, clip enabled, first foreign index, unused). When enabled, the
+    /// surface renders the field only where its own ball's contribution is
+    /// the largest among the foreign balls (index >= first foreign), so
+    /// metaball surfaces tile the merged blob exactly — without the clip,
+    /// every surface renders the whole field and the canvases' overlap
+    /// double-composites into visible straight-edge seams. Zero flag = the
+    /// whole field renders (single-surface fields, the default).
+    pub metaball_own: [f32; 4],
 }
 
 /// Configurable reveal animation, reusable by any liquid glass surface.
@@ -194,9 +231,17 @@ impl Default for GlassShaderParams {
             cbuffer_align: [0.0; 1],
             // Identity shape region: the shape space spans the surface.
             shape_region: [0.0, 0.0, 1.0, 1.0],
+            // Identity shape transform: the shape is drawn exactly where
+            // the shape region puts it.
+            shape_transform: [1.0, 1.0, 0.0, 0.0],
             // Own shape: rounded rect (kind 0); the superellipse exponent
-            // default (2.0) is inert for the rounded kind.
+            // default (2.0) is inert for the rounded kind, and the metaball
+            // count (0) disables the field.
             shape_meta: [0.0, 2.0, 0.0, 0.0],
+            // No metaballs by default: every surface draws its own preset.
+            metaballs: [[0.0; 4]; 6],
+            // No territory clip by default: single-surface fields render whole.
+            metaball_own: [0.0; 4],
         }
     }
 }
@@ -218,6 +263,37 @@ pub enum GlassShape {
 impl Default for GlassShape {
     fn default() -> Self {
         Self::Rounded
+    }
+}
+
+/// One metaball of a [`MetaballField`]: `(cx, cy, radius, weight)` in
+/// shape-region units (origin at the region's center, +y down, one unit =
+/// the region's height, x scaled by the region's aspect).
+pub type Metaball = [f32; 4];
+
+/// A surface's metaball field: up to six circles that blend into one liquid
+/// blob (the classic inverse-square isopotential, generalized by a tension
+/// exponent). A count of 0 disables the field — the surface draws its own
+/// shape preset instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetaballField {
+    /// Ball rows; only the first `count` entries participate.
+    pub balls: [Metaball; 6],
+    /// Active ball count (0..=6).
+    pub count: usize,
+    /// Field tension exponent (>= 1). 2 is the classic metaball blend;
+    /// higher values tighten merges into rounder necks, lower values
+    /// stretch them into long liquid threads.
+    pub tension: f32,
+}
+
+impl Default for MetaballField {
+    fn default() -> Self {
+        Self {
+            balls: [[0.0; 4]; 6],
+            count: 0,
+            tension: 2.0,
+        }
     }
 }
 

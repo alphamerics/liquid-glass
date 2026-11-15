@@ -137,6 +137,55 @@ pub(super) unsafe fn stack_above_host(
     Ok(())
 }
 
+/// Moves/resizes an ALREADY-PLACED surface above its host WITHOUT touching
+/// its z slot (`SWP_NOZORDER`). Per-frame re-anchors — a dragged metaball
+/// following its pointer — must never reorder the host's surface stack: the
+/// full re-pin inserts the surface at the BOTTOM of the host's surface
+/// stack, which let a plain panel's glass bury a dragged blob mid-drag. Z
+/// repair belongs to the host-event sync path, which re-pins every surface
+/// in a deliberate order.
+pub(super) unsafe fn move_above_host(
+    host: isize,
+    hwnd: HWND,
+    anchor: &SurfaceAnchor,
+) -> Result<(), String> {
+    let overlay = HWND(host as *mut _);
+    let bounds = anchor_rect(overlay_bounds(overlay)?, anchor);
+    SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        bounds.left,
+        bounds.top,
+        bounds.right - bounds.left,
+        bounds.bottom - bounds.top,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+    )
+    .map_err(|error| format!("Could not move the GPU surface: {error}"))
+}
+
+/// Moves/resizes an ALREADY-PLACED surface beneath its host WITHOUT touching
+/// its z slot (`SWP_NOZORDER`) — the beneath-host counterpart of
+/// [`move_above_host`]. The host itself is not re-raised: a per-frame
+/// geometry sync must not reorder anything.
+pub(super) unsafe fn move_beneath_host(
+    host: isize,
+    hwnd: HWND,
+    anchor: &SurfaceAnchor,
+) -> Result<(), String> {
+    let overlay = HWND(host as *mut _);
+    let bounds = anchor_rect(overlay_bounds(overlay)?, anchor);
+    SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        bounds.left,
+        bounds.top,
+        bounds.right - bounds.left,
+        bounds.bottom - bounds.top,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+    )
+    .map_err(|error| format!("Could not move the GPU surface: {error}"))
+}
+
 /// Aligns the native surface with its host window while retaining its lower
 /// Z order. Call whenever the host moves or resizes.
 pub(super) unsafe fn stack_beneath_host(
