@@ -93,10 +93,24 @@ impl AgileDirect3DDevice {
 }
 
 /// Dropping the feed stops WGC and releases the capture session.
+///
+/// Teardown is fenced against the frame callback, exactly like the monitor
+/// feed (`capture::CaptureFeed`): WGC's `Close()` racing an in-flight
+/// `TryGetNextFrame` access-violates. The callback takes the host lock
+/// BEFORE touching the pool and bails when the feed's generation has moved
+/// on; `Drop` takes that same lock to bump the generation, so no callback
+/// can be inside `TryGetNextFrame` when the session closes and every
+/// callback invoked afterwards sees a stale generation
+/// (`RemoveFrameArrived` does not wait for in-flight delegates).
 pub(crate) struct WindowCaptureFeed {
-    frame_pool: Direct3D11CaptureFramePool,
-    session: GraphicsCaptureSession,
+    frame_pool: Option<Direct3D11CaptureFramePool>,
+    session: Option<GraphicsCaptureSession>,
     frame_arrived_token: windows::Foundation::EventRegistrationToken,
+    /// The host handle, kept for the teardown fence (see the struct docs).
+    host: Arc<Mutex<dyn WindowFrameHost>>,
+    /// The teardown generation the callback checks; bumped under the host
+    /// lock by `Drop`.
+    generation: Arc<AtomicU64>,
 }
 
 impl WindowCaptureFeed {
@@ -109,11 +123,12 @@ impl WindowCaptureFeed {
         let Some(interval) = interval else {
             return;
         };
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
         // WinRT TimeSpan ticks are 100-ns units.
         let ticks = (interval.as_nanos().min(i64::MAX as u128) / 100) as i64;
-        let _ = self
-            .session
-            .SetMinUpdateInterval(TimeSpan { Duration: ticks });
+        let _ = session.SetMinUpdateInterval(TimeSpan { Duration: ticks });
     }
 }
 
@@ -182,53 +197,98 @@ impl WindowCaptureFeed {
 
         {
             let mut host = host.lock().expect("local glass host lock poisoned");
-            let frame = create_frame_texture(&device, window_size);
+            let frame = create_frame_texture(&device, window_size)?;
             host.set_frame(frame, window_size);
         }
 
         let callback_host = Arc::clone(host);
         let callback_device = AgileDirect3DDevice(direct3d_device);
+        // The teardown fence's generation: the callback captures its value
+        // and only touches the pool while it still matches (see the struct
+        // docs and `Drop`).
+        let callback_generation = Arc::new(AtomicU64::new(0));
+        let my_generation = callback_generation.load(Ordering::Acquire);
         let frame_arrived_handler = windows::Foundation::TypedEventHandler::<
             Direct3D11CaptureFramePool,
             windows::core::IInspectable,
-        >::new(move |pool, _| {
-            let Some(pool) = pool.as_ref() else {
-                return Ok(());
-            };
-            frame_arrived(&callback_host, &callback_device, pool)
+        >::new({
+            let callback_generation = Arc::clone(&callback_generation);
+            move |pool, _| {
+                let Some(pool) = pool.as_ref() else {
+                    return Ok(());
+                };
+                // The host lock FIRST, the generation check SECOND, the pool
+                // LAST (see the struct docs): the fence that lets `Drop` close
+                // the session without racing an in-flight TryGetNextFrame. A
+                // poisoned host lock means a panic elsewhere already doomed the
+                // process (the release profile aborts) — bail quietly.
+                let Ok(mut host) = callback_host.lock() else {
+                    return Ok(());
+                };
+                if callback_generation.load(Ordering::Acquire) != my_generation {
+                    return Ok(());
+                }
+                frame_arrived(&mut *host, &callback_device, pool)
+            }
         });
-        let frame_arrived_token =
-            frame_pool
-                .FrameArrived(&frame_arrived_handler)
-                .map_err(|error| {
-                    format!("Could not register the local glass frame callback: {error}")
-                })?;
-
-        session
-            .StartCapture()
-            .map_err(|error| format!("Could not start the local glass capture: {error}"))?;
+        // Registration / start failures tear the just-created WGC objects
+        // down through the reaper: releasing a live frame pool without
+        // `Close` leaves the capture pipeline running on released objects.
+        let frame_arrived_token = match frame_pool.FrameArrived(&frame_arrived_handler) {
+            Ok(token) => token,
+            Err(error) => {
+                crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+                    pool: Some(frame_pool),
+                    session: Some(session),
+                    token: None,
+                });
+                return Err(format!(
+                    "Could not register the local glass frame callback: {error}"
+                ));
+            }
+        };
+        if let Err(error) = session.StartCapture() {
+            crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+                pool: Some(frame_pool),
+                session: Some(session),
+                token: Some(frame_arrived_token),
+            });
+            return Err(format!("Could not start the local glass capture: {error}"));
+        }
 
         Ok(Self {
-            frame_pool,
-            session,
+            frame_pool: Some(frame_pool),
+            session: Some(session),
             frame_arrived_token,
+            host: Arc::clone(host),
+            generation: callback_generation,
         })
     }
 }
 
 impl Drop for WindowCaptureFeed {
     fn drop(&mut self) {
-        let _ = self.frame_pool.RemoveFrameArrived(self.frame_arrived_token);
-        let _ = self.session.Close();
-        let _ = self.frame_pool.Close();
+        // The teardown fence (see the struct docs) stays synchronous; the
+        // WinRT teardown is queued to the shared reaper so the render loop
+        // never stalls inside `Close` (which waits for the capture pipeline
+        // to drain).
+        if let Ok(_fence) = self.host.lock() {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+            pool: self.frame_pool.take(),
+            session: self.session.take(),
+            token: Some(self.frame_arrived_token),
+        });
     }
 }
 
-/// The frame callback (runs on a WGC worker thread): copies the newest
-/// frame into the stable texture, rebuilding the pool when the window
-/// changes size.
+/// The frame callback (runs on a WGC worker thread, called with the host
+/// lock already held by the handler — see the fence in
+/// [`WindowCaptureFeed::start`]): copies the newest frame into the stable
+/// texture, rebuilding the pool when the window changes size.
 fn frame_arrived(
-    host: &Arc<Mutex<dyn WindowFrameHost>>,
+    host: &mut dyn WindowFrameHost,
     device: &AgileDirect3DDevice,
     pool: &Direct3D11CaptureFramePool,
 ) -> windows::core::Result<()> {
@@ -241,18 +301,21 @@ fn frame_arrived(
     if size.Width <= 0 || size.Height <= 0 {
         return Ok(());
     }
-    let mut host = host.lock().expect("local glass host lock poisoned");
     if host.frame_size() != size {
         // The window resized (or DPI changed): reroute the pool and
-        // rebuild the stable texture at the new size.
+        // rebuild the stable texture at the new size. A failed texture
+        // creation (a driver reset, usually) skips the frame instead of
+        // aborting the process.
         let _ = pool.Recreate(
             device.as_device(),
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             FRAME_POOL_BUFFERS,
             size,
         );
-        let fresh = create_frame_texture(&host.device(), size);
-        host.set_frame(fresh, size);
+        match create_frame_texture(&host.device(), size) {
+            Ok(fresh) => host.set_frame(fresh, size),
+            Err(error) => eprintln!("Glassbar local glass frame restart failed: {error}"),
+        }
         return Ok(());
     }
     let Some(stable) = host.frame_texture() else {
@@ -282,10 +345,14 @@ fn frame_arrived(
     Ok(())
 }
 
+/// The stable texture plus its shader view, created together. Returns a
+/// `Result` rather than panicking: this runs on the WGC callback thread on
+/// the recreate path, and the release profile aborts the whole process on
+/// any panic — a D3D failure must degrade to a skipped frame instead.
 fn create_frame_texture(
     device: &ID3D11Device,
     size: SizeInt32,
-) -> (ID3D11Texture2D, ID3D11ShaderResourceView) {
+) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView), String> {
     let mut texture = None;
     unsafe {
         device.CreateTexture2D(
@@ -309,16 +376,15 @@ fn create_frame_texture(
             Some(&mut texture),
         )
     }
-    .map_err(|error| format!("Could not create the local glass frame texture: {error}"))
-    .expect("Could not create the local glass frame texture");
+    .map_err(|error| format!("Could not create the local glass frame texture: {error}"))?;
     let texture = texture.expect("local glass frame texture missing");
     let mut view = None;
     unsafe {
         device
             .CreateShaderResourceView(&texture, None, Some(&mut view))
-            .expect("Could not create the local glass frame view");
+            .map_err(|error| format!("Could not create the local glass frame view: {error}"))?;
     }
-    (texture, view.expect("local glass frame view missing"))
+    Ok((texture, view.expect("local glass frame view missing")))
 }
 
 fn window_item(target: isize) -> Result<GraphicsCaptureItem, String> {
@@ -337,7 +403,5 @@ fn window_item(target: isize) -> Result<GraphicsCaptureItem, String> {
 /// GraphicsCaptureSession::SetBorderRequired(false) is accepted. Requires the
 /// packaged graphicsCaptureProgrammatic capability; no-op elsewhere.
 fn request_borderless_capture() {
-    use windows::Graphics::Capture::{GraphicsCaptureAccess, GraphicsCaptureAccessKind};
-    let _ = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
-        .and_then(|operation| operation.get());
+    crate::capture::request_borderless_capture();
 }

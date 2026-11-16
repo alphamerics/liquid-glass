@@ -1,8 +1,5 @@
 //! The pill's squash/stretch spring control.
 
-
-
-
 use super::GlassSurface;
 impl GlassSurface {
     /// Sets the pill's uniform shape scale (1.0 = full size). Used by the

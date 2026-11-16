@@ -38,9 +38,11 @@ pub(super) struct ThumbConstants {
 /// whose epoch no longer matches the core's is superseded, and its callback
 /// must not touch the core or the pool.
 pub(super) struct Capture {
-    pub(super) frame_pool: Direct3D11CaptureFramePool,
-    pub(super) session: GraphicsCaptureSession,
+    pub(super) frame_pool: Option<Direct3D11CaptureFramePool>,
+    pub(super) session: Option<GraphicsCaptureSession>,
     pub(super) frame_arrived_token: windows::Foundation::EventRegistrationToken,
+    /// The core handle, for the teardown fence (see `Drop`).
+    pub(super) core: SendCore,
     /// The capture epoch this session started under; debugging aid (the
     /// ground truth lives in the frame callback's closure).
     #[allow(dead_code)]
@@ -49,15 +51,33 @@ pub(super) struct Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        // Remember: never run this while holding the core mutex. `Close`
-        // synchronizes with the free-threaded frame callback, and that
-        // callback needs the core lock to run — tearing down under the lock
-        // deadlocks (or races the pool's close against an in-flight
-        // `TryGetNextFrame`, which is an access violation). Callers keep the
-        // session out of the core and drop it after releasing the lock.
-        let _ = self.frame_pool.RemoveFrameArrived(self.frame_arrived_token);
-        let _ = self.session.Close();
-        let _ = self.frame_pool.Close();
+        // The teardown fence, the thumbnail's counterpart of
+        // `CaptureFeed`/`WindowCaptureFeed`'s host-lock fence: a callback
+        // that ALREADY passed its epoch check is still inside the pool
+        // (TryGetNextFrame/CopyResource), and WGC's `Close` racing that
+        // in-flight access access-violates — the epoch bump alone fences
+        // only callbacks dispatched AFTER it. The frame callback holds the
+        // core lock across its pool access, so acquiring and releasing it
+        // here waits every in-flight callback out before the reaper's
+        // `Close` runs; every callback dispatched later bails at its first
+        // check (the caller bumps the epoch BEFORE dropping this session).
+        // MUST run without the core lock held (a self-drop under the lock
+        // would self-deadlock) — every current drop site takes the session
+        // out of the core under the lock and drops it after releasing.
+        {
+            // The named binding IS the fence: it must live until the
+            // in-flight callback has finished.
+            let fence = self.core.0.lock();
+            drop(fence);
+        }
+        // The WinRT teardown itself must not block the caller any longer
+        // than the fence: `Close` synchronizes with the capture pipeline,
+        // so the objects go to the shared reaper worker.
+        crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+            pool: self.frame_pool.take(),
+            session: self.session.take(),
+            token: Some(self.frame_arrived_token),
+        });
     }
 }
 

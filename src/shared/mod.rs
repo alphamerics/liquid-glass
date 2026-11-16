@@ -14,23 +14,23 @@
 //! torn down after a short idle delay: the OS capture pipeline then idles
 //! with the glass instead of capturing the monitor forever for no one.
 
-
 mod backdrop;
 mod blur;
 mod d3d;
+pub(crate) mod reaper;
 mod render_loop;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use backdrop::{Backdrop, BlurInputs, CropConstants};
 #[cfg(test)]
 pub(crate) use backdrop::grid_aligned_crop;
+pub(crate) use backdrop::{Backdrop, BlurInputs, CropConstants};
 pub(crate) use blur::{blur_plan_with_caps, BlurEngine};
 #[cfg(test)]
 pub(crate) use blur::{BlurPlan, KAWASE_HLSL};
-pub(crate) use d3d::{compiled_shader, constant_buffer, create_linear_clamp_sampler};
 #[cfg(test)]
 pub(crate) use d3d::compile_shader_from;
+pub(crate) use d3d::{compiled_shader, constant_buffer, create_linear_clamp_sampler};
 use render_loop::spawn_render_loop;
 
 use std::collections::HashMap;
@@ -52,7 +52,6 @@ use crate::params::BackdropSource;
 use crate::quality::{detect_gpu_class, resolve, GpuClass, QualityCaps};
 use crate::surface::{create_d3d11_device, SharedCompositor};
 use crate::window_capture::WindowCaptureFeed;
-
 
 /// Whether the D3D11 device is gone (driver reset/TDR). All GPU work fails
 /// after this; continuing to submit would crash-loop the driver instead of
@@ -391,9 +390,7 @@ impl SharedEngine {
         else {
             return Ok(());
         };
-        let mut compositor = compositor
-            .lock()
-            .expect("D3D11 compositor lock poisoned");
+        let mut compositor = compositor.lock().expect("D3D11 compositor lock poisoned");
         if compositor.is_paused() {
             return Ok(());
         }

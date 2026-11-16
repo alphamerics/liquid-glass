@@ -8,22 +8,17 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{DestroyWindow, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE},
 };
 
+use crate::backdrop::SurfaceRoute;
+use crate::params::{BackdropSource, GlassConfig, MetaballField};
+use crate::shared::engine;
 use crate::surface::compositor::D3D11Compositor;
 use crate::surface::geometry::{
     anchor_rect, height, overlay_bounds, primary_monitor_bounds, width, window_frame_rect,
 };
-use crate::surface::window::{
-    create_surface_window,
-    stack_above_host, stack_beneath_host,
-};
+use crate::surface::window::{create_surface_window, stack_above_host, stack_beneath_host};
 use crate::surface::SharedCompositor;
-use crate::backdrop::SurfaceRoute;
-use crate::params::{
-    BackdropSource, GlassConfig, MetaballField,
-};
-use crate::shared::engine;
 
-use super::{GlassSurface, scale_texel_params};
+use super::{scale_texel_params, GlassSurface};
 impl GlassSurface {
     /// Creates the GPU surface for `host` (an HWND value) and joins the
     /// shared engine's feeds.
@@ -161,5 +156,4 @@ impl GlassSurface {
     pub fn compositor(&self) -> SharedCompositor {
         Arc::clone(&self.compositor)
     }
-
 }

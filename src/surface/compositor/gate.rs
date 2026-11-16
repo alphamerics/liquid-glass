@@ -10,7 +10,6 @@ use crate::params::GlassShaderParams;
 use super::D3D11Compositor;
 
 impl D3D11Compositor {
-
     /// Stops (or resumes) all rendering for this surface. Parked surfaces are
     /// paused: their presentation tick and capture callbacks then do nothing
     /// beyond a boolean check, so invisible glass costs no GPU time.
@@ -199,15 +198,17 @@ impl D3D11Compositor {
     }
 
     /// Whether a continuous compositor-owned animation is running (the
-    /// reveal, the shape transform's pursuit spring or the pill squash
-    /// spring). The shared render loop uses this to pace its ticks to the
-    /// desktop compositor instead of the fixed idle interval.
+    /// reveal, the shape transform's pursuit spring, the shape transform's
+    /// bezier tween or the pill squash spring). The shared render loop uses
+    /// this to pace its ticks to the desktop compositor instead of the
+    /// fixed idle interval.
     pub fn is_animating(&self) -> bool {
         if self.paused {
             return false;
         }
         (self.reveal_current - self.reveal_target).abs() > 0.001
             || self.shape_spring.is_some()
+            || self.shape_tween.is_some()
             || self.pill_spring.is_some()
     }
 }

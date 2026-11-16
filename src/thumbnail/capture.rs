@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use windows::core::Interface;
 use windows::Graphics::{
@@ -7,21 +7,19 @@ use windows::Graphics::{
     SizeInt32,
 };
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11ShaderResourceView, ID3D11Texture2D,
-    D3D11_BIND_RENDER_TARGET,
+    ID3D11Device, ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::WinRT::{
     Direct3D11::IDirect3DDxgiInterfaceAccess, Graphics::Capture::IGraphicsCaptureItemInterop,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
 
-
+use super::state::{AgileWinRTDevice, Capture, SendCore};
 use super::FRAME_POOL_BUFFERS;
-use super::state::{AgileWinRTDevice, Capture, SendCore, ThumbCore};
 pub(super) fn measure_window(window: isize) -> Result<(u32, u32), String> {
     let mut client = RECT::default();
     let hwnd = HWND(window as *mut _);
@@ -41,11 +39,7 @@ pub(super) fn measure_window(window: isize) -> Result<(u32, u32), String> {
 /// shared D3D handles are cloned out under a brief lock first. `epoch` is the
 /// capture epoch the caller started under; the returned session is tagged
 /// with it so superseded sessions can be recognized (and discarded).
-pub(super) fn start_capture(
-    core: &Arc<Mutex<ThumbCore>>,
-    target: isize,
-    epoch: u64,
-) -> Result<Capture, String> {
+pub(super) fn start_capture(core: &SendCore, target: isize, epoch: u64) -> Result<Capture, String> {
     // Windows 11: request the borderless-capture permission once so the
     // session can disable the yellow capture border (no-op unpackaged).
     request_borderless_capture();
@@ -62,6 +56,7 @@ pub(super) fn start_capture(
 
     let winrt_device = {
         let core = core
+            .0
             .lock()
             .map_err(|_| "thumbnail lock poisoned".to_owned())?;
         AgileWinRTDevice(Arc::clone(&core.winrt_device.0))
@@ -83,7 +78,7 @@ pub(super) fn start_capture(
         eprintln!("Thumbnail capture border stays on (needs packaged capability): {error}");
     }
 
-    let handler_core = SendCore(Arc::clone(core));
+    let handler_core = core.clone();
     let handler_epoch = epoch;
     let frame_arrived_handler = windows::Foundation::TypedEventHandler::<
         Direct3D11CaptureFramePool,
@@ -94,26 +89,56 @@ pub(super) fn start_capture(
         };
         frame_arrived(&handler_core, &winrt_device, pool, handler_epoch)
     });
-    let frame_arrived_token = frame_pool
-        .FrameArrived(&frame_arrived_handler)
-        .map_err(|error| format!("Could not register the thumbnail frame callback: {error}"))?;
-    session
-        .StartCapture()
-        .map_err(|error| format!("Could not start the window capture: {error}"))?;
+    // Registration / start failures must still tear the just-created WGC
+    // objects down through the reaper: releasing a live frame pool without
+    // `Close` leaves the capture pipeline running on released objects. The
+    // StartCapture failure's fence waits out any callback the synchronous
+    // start re-entered (see `Capture::drop`); the registration failure has
+    // no callback to fence.
+    let frame_arrived_token = match frame_pool.FrameArrived(&frame_arrived_handler) {
+        Ok(token) => token,
+        Err(error) => {
+            crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+                pool: Some(frame_pool),
+                session: Some(session),
+                token: None,
+            });
+            return Err(format!(
+                "Could not register the thumbnail frame callback: {error}"
+            ));
+        }
+    };
+    if let Err(error) = session.StartCapture() {
+        {
+            // The named binding IS the fence (see `Capture::drop`).
+            let fence = core.0.lock();
+            drop(fence);
+        }
+        crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+            pool: Some(frame_pool),
+            session: Some(session),
+            token: Some(frame_arrived_token),
+        });
+        return Err(format!("Could not start the window capture: {error}"));
+    }
 
     // Client-area inset measured once: a moving window keeps the same
     // frame-relative crop; a resizing one recomputes on the next retarget.
-    let mut core = core
-        .lock()
-        .map_err(|_| "thumbnail lock poisoned".to_owned())?;
-    if core.capture_epoch == epoch {
-        core.crop = client_crop_uv(target);
+    {
+        let mut core = core
+            .0
+            .lock()
+            .map_err(|_| "thumbnail lock poisoned".to_owned())?;
+        if core.capture_epoch == epoch {
+            core.crop = client_crop_uv(target);
+        }
     }
 
     Ok(Capture {
-        frame_pool,
-        session,
+        frame_pool: Some(frame_pool),
+        session: Some(session),
         frame_arrived_token,
+        core: core.clone(),
         epoch,
     })
 }
@@ -258,7 +283,5 @@ fn create_frame_texture(
 }
 
 fn request_borderless_capture() {
-    use windows::Graphics::Capture::{GraphicsCaptureAccess, GraphicsCaptureAccessKind};
-    let _ = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
-        .and_then(|operation| operation.get());
+    crate::capture::request_borderless_capture();
 }

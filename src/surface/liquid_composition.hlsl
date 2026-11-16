@@ -95,13 +95,25 @@ cbuffer GlassParams : register(b1) {
     // field's tension exponent).
     float4 shapeMeta;
     // ---- The metaball field (kind 2) ----
-    // Up to six balls, each (cx, cy, radius, weight) in shape-region units
-    // (the same space revealOrigin uses: region center at the origin, +y
-    // down, one unit = the region's height). Every ball contributes
-    // weight * (radius / distance)^tension to an isopotential whose surface
-    // sits where the sum is exactly 1: isolated balls read as exact
-    // circles, nearby balls merge with the characteristic liquid neck.
+    // Up to six potential rows, each (cx, cy, effectiveRadius, weight) in
+    // shape-region units (the same space revealOrigin uses: region center
+    // at the origin, +y down, one unit = the region's height). The
+    // effective radius (weight^(1/tension) folded into the ball's minor
+    // extent) is the ball's influence scale; each ball's silhouette lives
+    // in the shape rows below. Every ball contributes
+    // (effectiveRadius / (effectiveRadius + sd))^tension — sd the ball's
+    // own signed distance — to an isopotential whose surface sits where
+    // the sum is exactly 1: isolated balls read as their own exact
+    // silhouettes, nearby balls merge with the characteristic liquid neck.
     float4 metaballs[6];
+    // Per-ball SHAPE rows (kind 2): each (exponent, extentX, extentY, spare)
+    // in the same shape-region units — the superellipse the ball's own
+    // signed distance evaluates. Exponent 2 with equal extents is the plain
+    // circle (the point-distance fast path below); unequal extents make the
+    // ball an ellipse, higher exponents squircles and boxes. The extents
+    // arrive pre-folded with the ball's weight, exactly like the effective
+    // radius, so an isolated shaped ball surfaces on its own silhouette.
+    float4 metaballShapes[6];
     // Cross-surface territory clip: (own ball index, clip enabled, first
     // foreign index, unused). When enabled, this surface renders the field
     // only where its OWN ball's contribution is the largest among the
@@ -253,16 +265,28 @@ float roundedBoxSd(float2 position, float2 halfExtents, float radius) {
 }
 
 // The rounded box's outward normal (same mechanics as before, around the
-// shape's own center).
+// shape's own center). The straight-segment region's distance is the min()
+// of the two axis distances, whose gradient flips 90 degrees across the
+// corner ridge (the diagonal through the neighbouring corner-circle
+// centers) — and the edge refraction and dispersion ride that gradient, so
+// on large containers the wide edge band drew the flip as four hard
+// diagonal shear seams meeting in the middle (the "X"). Blend the two axis
+// normals smoothly across each ridge over the corner radius — the same
+// scale the corner arcs rotate the normal through — so the field turns
+// continuously instead of teleporting. The blend lives strictly inside the
+// silhouette (the zero contour never enters this region), so the
+// antialiased edge, border and bevel are unchanged; capsules and circles
+// (radius = half the smaller extent) have no straight segments and never
+// reach this branch at all.
 float2 roundedBoxNormal(float2 position, float2 halfExtents, float radius) {
     const float2 q = abs(position) - (halfExtents - radius);
     if (q.x > 0.0 && q.y > 0.0) {
         return normalize(sign(position) * q);
     }
-    if (q.x > q.y) {
-        return float2(sign(position.x), 0.0);
-    }
-    return float2(0.0, sign(position.y));
+    const float blendHalfWidth = max(radius, 1e-4);
+    const float blend = smoothstep(-blendHalfWidth, blendHalfWidth, q.x - q.y);
+    return normalize(lerp(float2(0.0, sign(position.y)),
+                          float2(sign(position.x), 0.0), blend) + 1e-6);
 }
 
 // Superellipse (squircle) pseudo-SDF: f(p) = ||p / halfExtents||_n - 1 is
@@ -296,34 +320,70 @@ float2 superellipseNormal(float2 position, float2 halfExtents, float exponent) {
         sign(position.y) * pow(q.y, n - 1.0) / safe.y) + 1e-6);
 }
 
+// The superellipse pseudo-SDF fused with its outward normal: one evaluation
+// serves both consumers of the metaball field's shaped-ball branch (the
+// signed distance AND the gradient direction the field's normal rides on).
+// Same math as superellipseSd above, with the normalized gradient riding
+// out through the out parameter. (superellipseSd / superellipseNormal stay
+// as-is for the kind-1 preset; this fused variant exists so the field loop
+// does not evaluate the superellipse twice per shaped ball.)
+float superellipseSdNormal(
+    float2 position, float2 halfExtents, float exponent, out float2 normal) {
+    const float n = max(exponent, 1.0);
+    const float2 safe = max(halfExtents, 1e-5);
+    const float2 q = abs(position) / safe;
+    const float g = pow(q.x, n) + pow(q.y, n);
+    const float f = pow(max(g, 0.0), 1.0 / n) - 1.0;
+    const float common = pow(max(g, 1e-6), 1.0 / n - 1.0);
+    const float2 gradient = common * float2(
+        sign(position.x) * pow(q.x, n - 1.0) / safe.x,
+        sign(position.y) * pow(q.y, n - 1.0) / safe.y);
+    const float gradientLength = max(length(gradient), 1e-6);
+    normal = gradient / gradientLength;
+    return f / gradientLength;
+}
+
+// Whether a metaball ball's shape row is the plain circle: exponent 2 with
+// equal extents — the case the field's point-distance fast path evaluates.
+// Rides on constant-buffer data, so the field loop's per-ball dispatch is
+// uniform across every pixel.
+bool isCircleRow(float4 shape) {
+    return abs(shape.x - 2.0) < 1e-4 && abs(shape.y - shape.z) < 1e-4;
+}
+
 // Metaball field (kind 2): the classic inverse-square isopotential,
-// generalized by a tension exponent n. Ball i contributes
-// (rᵢ·wᵢ^(1/n) / |p - cᵢ|)ⁿ to the potential — the effective radius
-// rᵢ·wᵢ^(1/n) arrives PRECOMPUTED from the CPU in the row's z slot — and
-// the surface sits where the sum is exactly 1. An isolated ball (weight 1)
-// is the exact circle of its radius; nearby balls merge with the
-// characteristic liquid neck (higher tension merges tighter and rounder,
-// lower tension stretches long threads). On top of the isopotential,
-// every ball's influence carries a distance falloff (see the
-// METABALL_FALLOFF_* defines): its contribution dies out by a couple of
-// the ball's own radii, so separated balls stop interacting instead of
-// bulging and pulling at each other from across the gap.
+// generalized by a tension exponent n — evaluated over each ball's OWN
+// signed distance, so a ball may be a circle or a superellipse. Ball i
+// contributes (rᵢ / (rᵢ + sdᵢ(p)))ⁿ to the potential, where sdᵢ is the
+// ball's signed distance and rᵢ its influence radius (weight^(1/n) folded
+// by the CPU into both the radius and the silhouette extents). For a
+// circle, sdᵢ = |p − cᵢ| − rᵢ makes the contribution algebraically the
+// classic (rᵢ / dist)ⁿ; for a shaped ball, sdᵢ is the superellipse
+// pseudo-SDF of (extentX, extentY, exponent). The surface sits where the
+// sum is exactly 1, so an isolated ball surfaces exactly ON ITS OWN
+// SILHOUETTE (the circle of its radius, or its superellipse) and nearby
+// balls merge with the characteristic liquid neck (higher tension merges
+// tighter and rounder, lower tension stretches long threads). On top of
+// the isopotential, every ball's influence carries a distance falloff
+// (see the METABALL_FALLOFF_* defines): its contribution dies out by a
+// couple of the ball's own influence radii BEYOND its silhouette, so
+// separated balls stop interacting instead of bulging and pulling at each
+// other from across the gap.
 //
 // The distance estimate stitches two regimes:
 //   - ON and outside the isosurface, the first-order distance
 //     f / |∇f| (the superellipse's trick) is smooth with the exact
 //     boundary slope — the AA band, refraction and bevel live here.
-//   - Strictly inside, the potential is singular at the ball centers and
-//     its first-order distance collapses back toward zero (a shallow
-//     read that would light blob centers like rim crests) and blows up
-//     at symmetric merge saddles. There the estimate falls to the
-//     nearest ball's own circle distance: every ball's disk lies strictly
-//     inside the blob, so that distance is a valid metric interior depth
-//     whose zero contour can never reach the silhouette. A floor on the
-//     gradient magnitude keeps flat-field regions (merge saddles) from
-//     exploding the potential branch.
+//   - Strictly inside, the potential's first-order distance collapses
+//     back toward zero (a shallow read that would light blob interiors
+//     like rim crests) and blows up at symmetric merge saddles. There the
+//     estimate falls to the nearest ball's own signed distance: every
+//     ball's silhouette lies strictly inside the blob, so that distance
+//     is a valid metric interior depth whose zero contour can never reach
+//     the silhouette. A floor on the gradient magnitude keeps flat-field
+//     regions (merge saddles) from exploding the potential branch.
 // The min of the two keeps the potential's merge-exact boundary and the
-// disks' metric interior; the silhouette is exactly the F = 1 isosurface.
+// balls' metric interior; the silhouette is exactly the F = 1 isosurface.
 //
 // The gradient (toward growing potential) rides out through the out
 // parameter: the fused normal dispatch reuses it instead of re-running the
@@ -346,6 +406,13 @@ float metaballFieldSd(float2 position, float4 meta, out float2 gradient) {
     // outside them every contribution stays under 1/count, so the sum
     // stays under the F = 1 isopotential. Pixels past the union's bounding
     // circle (most of the canvas' slack padding) skip the loop entirely.
+    // Per-ball disc radius: a circle's is the classic tight
+    // effectiveRadius * countInflation; a shaped ball's silhouette reaches
+    // at most hypot(extents) from its center (the superellipse is inside
+    // that disc), and its contribution stays under 1/count once the signed
+    // distance clears effectiveRadius * (countInflation - 1) — the
+    // triangle-inequality bound, which reduces to the circle's exactly
+    // when the silhouette reach equals the influence radius.
     const float countInflation = quadratic ? sqrt(meta.z) : pow(meta.z, 1.0 / n);
     float2 boundMin = float2(1e3, 1e3);
     float2 boundMax = float2(-1e3, -1e3);
@@ -354,9 +421,14 @@ float metaballFieldSd(float2 position, float4 meta, out float2 gradient) {
         if (probe >= (int)meta.z) {
             break;
         }
-        const float inflated = metaballs[probe].z * countInflation;
-        boundMin = min(boundMin, metaballs[probe].xy - inflated);
-        boundMax = max(boundMax, metaballs[probe].xy + inflated);
+        const float4 probeShape = metaballShapes[probe];
+        const float probeRadius = metaballs[probe].z;
+        const float probeReach = isCircleRow(probeShape)
+            ? probeRadius * countInflation
+            : sqrt(probeShape.y * probeShape.y + probeShape.z * probeShape.z)
+                + probeRadius * (countInflation - 1.0);
+        boundMin = min(boundMin, metaballs[probe].xy - probeReach);
+        boundMax = max(boundMax, metaballs[probe].xy + probeReach);
     }
     const float boundSd = length(position - 0.5 * (boundMin + boundMax))
         - 0.5 * length(boundMax - boundMin);
@@ -365,6 +437,13 @@ float metaballFieldSd(float2 position, float4 meta, out float2 gradient) {
     }
     float field = 0.0;
     float nearestDisk = 1e3;
+    // The deepest plausible interior depth: any point of the merged blob
+    // is within the deepest ball's own silhouette, so the returned
+    // interior reading saturates at the largest influence radius (a
+    // shaped ball's pseudo-SDF collapses deep inside — its interior
+    // gradient dies — and the potential branch would explode there
+    // without the cap; a circle's disk distance is naturally bounded).
+    float maxInfluence = 0.0;
     // The territory clip's bookkeeping: the own ball's contribution and the
     // strongest foreign one (see metaballOwn in the cbuffer).
     const bool clipTerritory = metaballOwn.y > 0.5;
@@ -377,30 +456,58 @@ float metaballFieldSd(float2 position, float4 meta, out float2 gradient) {
         if (ball >= (int)meta.z) {
             break;
         }
-        const float2 offset = position - metaballs[ball].xy;
-        const float dist = sqrt(dot(offset, offset) + 1e-5);
+        const float4 shape = metaballShapes[ball];
         // The effective radius (radius * weight^(1/n)) arrives precomputed
         // from the CPU in slot z — a per-ball constant, never per-pixel
         // work (slot w is inert layout parity).
         const float effectiveRadius = metaballs[ball].z;
+        // Per-ball dispatch: a circle ball (exponent 2, equal extents)
+        // runs the classic point-distance path; a shaped ball evaluates
+        // its own superellipse pseudo-SDF. The condition rides on
+        // constant-buffer data, so every pixel of a wave takes the same
+        // path — no divergence, and all-circle fields never pay the
+        // superellipse's pows.
+        float sdf;
+        float2 sdfGradient;
+        float u;
+        if (isCircleRow(shape)) {
+            const float2 offset = position - metaballs[ball].xy;
+            const float dist = sqrt(dot(offset, offset) + 1e-5);
+            sdf = dist - effectiveRadius;
+            sdfGradient = offset / dist;
+            u = dist;
+        } else {
+            sdf = superellipseSdNormal(
+                position - metaballs[ball].xy,
+                float2(shape.y, shape.z),
+                shape.x,
+                sdfGradient);
+            // The contribution's denominator: the influence radius plus
+            // the signed distance — zero on the silhouette's own er-ring
+            // inside, so clamp against the division.
+            u = max(effectiveRadius + sdf, 1e-5);
+        }
         const float raw = quadratic
-            ? effectiveRadius * effectiveRadius / (dist * dist)
-            : pow(effectiveRadius / dist, n);
+            ? effectiveRadius * effectiveRadius / (u * u)
+            : pow(effectiveRadius / u, n);
         // The distance falloff: influence is full inside the start
         // distance and smoothly extinguished by the end one (both in
-        // radii of this ball — see the defines). The window's own slope
-        // is left out of the gradient below: it only bends the normal in
-        // the weak-field tail, where the field's own contribution is too
-        // small to move the silhouette.
+        // influence radii, measured from the silhouette — er + sd is the
+        // circle's center distance, so the circle path is unchanged —
+        // see the defines). The window's own slope is left out of the
+        // gradient below: it only bends the normal in the weak-field
+        // tail, where the field's own contribution is too small to move
+        // the silhouette.
         const float fallStart = METABALL_FALLOFF_START * max(effectiveRadius, 1e-5);
         const float fallEnd = METABALL_FALLOFF_END * max(effectiveRadius, 1e-5);
-        const float window = 1.0 - smoothstep(fallStart, fallEnd, dist);
+        const float window = 1.0 - smoothstep(fallStart, fallEnd, u);
         const float contribution = raw * window;
         field += contribution;
-        // d/dp of the windowed (r/|d|)ⁿ = -n·contribution·offset/|d|²
+        // d/dp of (r / (r + sd))ⁿ = -n·contribution·∇sd / (r + sd)
         // (toward the ball, where the potential grows).
-        gradient += -n * contribution * offset / (dist * dist);
-        nearestDisk = min(nearestDisk, dist - effectiveRadius);
+        gradient += -n * contribution * sdfGradient / u;
+        nearestDisk = min(nearestDisk, sdf);
+        maxInfluence = max(maxInfluence, effectiveRadius);
         if (clipTerritory) {
             if (ball == ownIndex) {
                 ownContribution = contribution;
@@ -423,7 +530,7 @@ float metaballFieldSd(float2 position, float4 meta, out float2 gradient) {
             * (quadratic ? 0.5 * rsqrt(safeField) : pow(safeField, 1.0 / n - 1.0) / n),
         METABALL_GRADIENT_FLOOR);
     const float potentialSd = f / gradientMagnitude;
-    return min(nearestDisk, potentialSd);
+    return max(min(nearestDisk, potentialSd), -maxInfluence);
 }
 
 // Shape-preset dispatch (kind 0 = rounded box, 1 = superellipse,

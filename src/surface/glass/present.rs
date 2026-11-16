@@ -1,11 +1,9 @@
 //! Presentation control: the reveal animation, pausing and frame gating,
 //! the rate caps and the one-shot present.
 
-
-
-use crate::surface::window::hide_surface_window;
 use crate::params::RevealAnimation;
 use crate::shared::engine;
+use crate::surface::window::hide_surface_window;
 
 use super::GlassSurface;
 impl GlassSurface {

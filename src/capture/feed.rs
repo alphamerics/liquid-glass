@@ -2,7 +2,7 @@
 //! (dirty-region skips, rate caps, the stable-texture copy) and teardown.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -12,21 +12,19 @@ use windows::{
     Foundation::TimeSpan,
     Graphics::{
         Capture::{
-            Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode,
-            GraphicsCaptureSession,
+            Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureSession,
         },
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
-    Win32::Graphics::{
-        Direct3D11::ID3D11Texture2D,
-        Dxgi::IDXGIDevice,
+    Win32::Graphics::{Direct3D11::ID3D11Texture2D, Dxgi::IDXGIDevice},
+    Win32::System::WinRT::Direct3D11::{
+        CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
     },
-    Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
 };
 
 use super::frame::{create_frame_texture, scale_size};
-use super::{FrameHost, FRAME_POOL_BUFFERS};
 use super::monitor::{primary_monitor_item, request_borderless_capture};
+use super::{FrameHost, FRAME_POOL_BUFFERS};
 /// `CreateDirect3D11DeviceFromDXGIDevice` produces an agile WinRT wrapper
 /// around our free-threaded D3D11 device. windows-rs does not mark this
 /// particular WinRT interface as `Send`, though WGC invokes its free-threaded
@@ -42,12 +40,24 @@ impl AgileDirect3DDevice {
 }
 
 /// Dropping the feed stops WGC and releases the capture session.
+///
+/// Teardown is fenced against the frame callback: WGC's `Close()` racing an
+/// in-flight `TryGetNextFrame` access-violates (the same hazard the
+/// thumbnail surface documents in its `Capture::drop`). The fence: the
+/// callback takes the host lock BEFORE touching the pool and bails when the
+/// feed's generation has moved on, and `Drop` takes that same lock to bump
+/// the generation — so no callback can be inside `TryGetNextFrame` when the
+/// session closes, and every callback invoked afterwards sees a stale
+/// generation (`RemoveFrameArrived` does not wait for in-flight delegates).
 pub(crate) struct CaptureFeed {
-    frame_pool: Direct3D11CaptureFramePool,
-    session: GraphicsCaptureSession,
+    frame_pool: Option<Direct3D11CaptureFramePool>,
+    session: Option<GraphicsCaptureSession>,
     frame_arrived_token: windows::Foundation::EventRegistrationToken,
-    #[allow(dead_code)]
-    render_running: Arc<AtomicBool>,
+    /// The host handle, kept for the teardown fence (see `Drop`).
+    host: Arc<Mutex<dyn FrameHost>>,
+    /// The teardown generation the callback checks; bumped under the host
+    /// lock by `Drop`.
+    generation: Arc<AtomicU64>,
 }
 
 impl CaptureFeed {
@@ -60,13 +70,14 @@ impl CaptureFeed {
         let Some(interval) = interval else {
             return;
         };
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
         // WinRT TimeSpan ticks are 100-ns units. The class wrapper casts
         // to IGraphicsCaptureSession5 internally (a no-op failure on
         // systems without it).
         let ticks = (interval.as_nanos().min(i64::MAX as u128) / 100) as i64;
-        let _ = self
-            .session
-            .SetMinUpdateInterval(TimeSpan { Duration: ticks });
+        let _ = session.SetMinUpdateInterval(TimeSpan { Duration: ticks });
     }
 }
 
@@ -137,112 +148,169 @@ impl CaptureFeed {
 
         {
             let mut host = host.lock().expect("glass host lock poisoned");
-            let frame = create_frame_texture(&device, scaled);
+            let frame = create_frame_texture(&device, scaled)?;
             host.set_frame(frame, scaled);
         }
 
         let callback_host = Arc::clone(host);
         let callback_version = Arc::clone(version);
         let callback_device = AgileDirect3DDevice(direct3d_device.clone());
+        // The teardown fence's generation: the callback captures its value
+        // and only touches the pool while it still matches (see the struct
+        // docs and `Drop`).
+        let callback_generation = Arc::new(AtomicU64::new(0));
+        let my_generation = callback_generation.load(Ordering::Acquire);
         let frame_arrived_handler = windows::Foundation::TypedEventHandler::<
             Direct3D11CaptureFramePool,
             windows::core::IInspectable,
-        >::new(move |pool, _| {
-            let Some(pool) = pool.as_ref() else {
-                return Ok(());
-            };
-            let frame = match pool.TryGetNextFrame() {
-                Ok(frame) => frame,
-                Err(_) => return Ok(()),
-            };
-            let size = match frame.ContentSize() {
-                Ok(size) => size,
-                Err(_) => return Ok(()),
-            };
-            if size.Width <= 0 || size.Height <= 0 {
-                return Ok(());
-            }
-            let scaled = scale_size(size);
-            let mut host = callback_host.lock().expect("glass host lock poisoned");
-            if host.frame_size() != scaled {
-                // Monitor changed (resolution, DPI): restart the pool and the
-                // shared texture at the new scaled size.
-                let _ = pool.Recreate(
-                    callback_device.as_device(),
-                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                    FRAME_POOL_BUFFERS,
-                    scaled,
-                );
-                let frame = create_frame_texture(host.device(), scaled);
-                host.set_frame(frame, scaled);
-                return Ok(());
-            }
-            let texture = match unsafe {
-                frame
-                    .Surface()
-                    .and_then(|surface| surface.cast::<IDirect3DDxgiInterfaceAccess>())
-                    .and_then(|access| access.GetInterface::<ID3D11Texture2D>())
-            } {
-                Ok(texture) => texture,
-                Err(_) => return Ok(()),
-            };
-            if let Some(stable) = host.frame_texture().cloned() {
-                // WGC recycles its frame surfaces, so the newest frame must
-                // be copied out before the callback returns. But the copy is
-                // a full-monitor GPU blit — skip it entirely when every
-                // surface is parked: invisible glass must not keep burning
-                // GPU on frames it will never render (the first frame after
-                // any surface resumes refreshes the texture).
-                if host.any_active() {
-                    // Unchanged-content skip (24H2 dirty regions): a frame
-                    // with no dirty regions is a recomposition with identical
-                    // pixels — copying it would re-run the whole blur chain
-                    // for nothing. The render loop force-refreshes the
-                    // backdrop on a slow cadence, so a misreported frame at
-                    // worst costs two seconds of staleness.
-                    if dirty_regions
-                        && frame
-                            .DirtyRegions()
-                            .map_or(false, |regions| regions.Size() == Ok(0))
-                    {
-                        return Ok(());
+        >::new({
+            let callback_generation = Arc::clone(&callback_generation);
+            move |pool, _| {
+                // The host lock FIRST, the generation check SECOND, the pool
+                // LAST: a superseded callback must bail before TryGetNextFrame
+                // (Close() racing an in-flight TryGetNextFrame access-
+                // violates), and holding this lock across the call is what
+                // lets `Drop` fence the teardown. A poisoned host lock means a
+                // panic elsewhere already doomed this process (the release
+                // profile aborts) — bail quietly rather than re-panicking on
+                // the WGC thread.
+                let Some(pool) = pool.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(mut host) = callback_host.lock() else {
+                    return Ok(());
+                };
+                if callback_generation.load(Ordering::Acquire) != my_generation {
+                    return Ok(());
+                }
+                let frame = match pool.TryGetNextFrame() {
+                    Ok(frame) => frame,
+                    Err(_) => return Ok(()),
+                };
+                let size = match frame.ContentSize() {
+                    Ok(size) => size,
+                    Err(_) => return Ok(()),
+                };
+                if size.Width <= 0 || size.Height <= 0 {
+                    return Ok(());
+                }
+                let scaled = scale_size(size);
+                if host.frame_size() != scaled {
+                    // Monitor changed (resolution, DPI): restart the pool and the
+                    // shared texture at the new scaled size. A failed texture
+                    // creation (a driver reset, usually) skips the frame instead
+                    // of aborting the process; the render loop's device-lost
+                    // checks take over from here.
+                    let _ = pool.Recreate(
+                        callback_device.as_device(),
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        FRAME_POOL_BUFFERS,
+                        scaled,
+                    );
+                    match create_frame_texture(host.device(), scaled) {
+                        Ok(frame) => host.set_frame(frame, scaled),
+                        Err(error) => eprintln!("Glassbar capture frame restart failed: {error}"),
                     }
-                    // Quality-tier backdrop cap: at most one blit (and thus
-                    // one blur) per interval regardless of how fast frames
-                    // arrive — animations on a fast-changing desktop are
-                    // sampled at the cap, not at the monitor's frame rate.
-                    if host.capture_due() {
-                        let context = host.copy_context();
-                        unsafe {
-                            context.CopyResource(&stable, &texture);
+                    return Ok(());
+                }
+                let texture = match unsafe {
+                    frame
+                        .Surface()
+                        .and_then(|surface| surface.cast::<IDirect3DDxgiInterfaceAccess>())
+                        .and_then(|access| access.GetInterface::<ID3D11Texture2D>())
+                } {
+                    Ok(texture) => texture,
+                    Err(_) => return Ok(()),
+                };
+                if let Some(stable) = host.frame_texture().cloned() {
+                    // WGC recycles its frame surfaces, so the newest frame must
+                    // be copied out before the callback returns. But the copy is
+                    // a full-monitor GPU blit - skip it entirely when every
+                    // surface is parked: invisible glass must not keep burning
+                    // GPU on frames it will never render (the first frame after
+                    // any surface resumes refreshes the texture).
+                    if host.any_active() {
+                        // Unchanged-content skip (24H2 dirty regions): a frame
+                        // with no dirty regions is a recomposition with identical
+                        // pixels - copying it would re-run the whole blur chain
+                        // for nothing. The render loop force-refreshes the
+                        // backdrop on a slow cadence, so a misreported frame at
+                        // worst costs two seconds of staleness.
+                        if dirty_regions
+                            && frame
+                                .DirtyRegions()
+                                .map_or(false, |regions| regions.Size() == Ok(0))
+                        {
+                            return Ok(());
                         }
-                        callback_version.fetch_add(1, Ordering::Relaxed);
+                        // Quality-tier backdrop cap: at most one blit (and thus
+                        // one blur) per interval regardless of how fast frames
+                        // arrive - animations on a fast-changing desktop are
+                        // sampled at the cap, not at the monitor's frame rate.
+                        if host.capture_due() {
+                            let context = host.copy_context();
+                            unsafe {
+                                context.CopyResource(&stable, &texture);
+                            }
+                            callback_version.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
+                Ok(())
             }
-            Ok(())
         });
-        let frame_arrived_token = frame_pool
-            .FrameArrived(&frame_arrived_handler)
-            .map_err(|error| format!("Could not register the capture frame callback: {error}"))?;
-
-        session
-            .StartCapture()
-            .map_err(|error| format!("Could not start primary-monitor capture: {error}"))?;
+        // Registration / start failures tear the just-created WGC objects
+        // down through the reaper: releasing a live frame pool without
+        // `Close` leaves the capture pipeline running on released objects.
+        let frame_arrived_token = match frame_pool.FrameArrived(&frame_arrived_handler) {
+            Ok(token) => token,
+            Err(error) => {
+                crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+                    pool: Some(frame_pool),
+                    session: Some(session),
+                    token: None,
+                });
+                return Err(format!(
+                    "Could not register the capture frame callback: {error}"
+                ));
+            }
+        };
+        if let Err(error) = session.StartCapture() {
+            crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+                pool: Some(frame_pool),
+                session: Some(session),
+                token: Some(frame_arrived_token),
+            });
+            return Err(format!("Could not start primary-monitor capture: {error}"));
+        }
 
         Ok(Self {
-            frame_pool,
-            session,
+            frame_pool: Some(frame_pool),
+            session: Some(session),
             frame_arrived_token,
-            render_running: Arc::new(AtomicBool::new(true)),
+            host: Arc::clone(host),
+            generation: callback_generation,
         })
     }
 }
 
 impl Drop for CaptureFeed {
     fn drop(&mut self) {
-        let _ = self.frame_pool.RemoveFrameArrived(self.frame_arrived_token);
-        let _ = self.session.Close();
-        let _ = self.frame_pool.Close();
+        // The teardown fence (see the struct docs) stays SYNCHRONOUS: hold
+        // the host lock — which an in-flight callback holds across
+        // TryGetNextFrame, so taking it here waits that callback out — and
+        // bump the generation under it, so every callback invoked from now
+        // on bails at its first check. The WinRT teardown itself is then
+        // queued to the shared reaper: `Close` synchronizes with the
+        // capture pipeline, and a stalled `Close` would freeze the render
+        // loop — the glass — for as long as WGC refuses to drain.
+        if let Ok(_fence) = self.host.lock() {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        crate::shared::reaper::reap(crate::shared::reaper::Teardown {
+            pool: self.frame_pool.take(),
+            session: self.session.take(),
+            token: Some(self.frame_arrived_token),
+        });
     }
 }

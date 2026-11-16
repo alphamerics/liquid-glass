@@ -6,12 +6,14 @@
 //! three constant buffers (source rect, glass params, backdrop crop) and
 //! the compositor-owned animation state. The implementation is split by
 //! concern: [`present`] draws, [`gate`] schedules, [`animate`] moves,
-//! [`spring`] is the damped-spring math the animations integrate with.
+//! [`spring`] is the damped-spring math the animations integrate with, and
+//! [`easing`] the cubic-bezier time-based tweens.
 //!
 //! [`present`]: self::present
 //! [`gate`]: self::gate
 //! [`animate`]: self::animate
 //! [`spring`]: self::spring
+//! [`easing`]: self::easing
 
 use std::time::{Duration, Instant};
 
@@ -49,9 +51,11 @@ use crate::{
     SourceRectConstants,
 };
 
+use easing::ShapeTween;
 use spring::TransformSpring;
 
 mod animate;
+mod easing;
 mod gate;
 mod present;
 mod spring;
@@ -115,6 +119,10 @@ pub struct D3D11Compositor {
     /// The shape transform's spring — the animated retarget of the drawn
     /// shape (a resize pursuit). `None` = settled or absent.
     shape_spring: Option<TransformSpring>,
+    /// The shape transform's time-based tween — the CSS-style eased
+    /// counterpart of the spring (cubic-bezier paced, endpoints + clock).
+    /// `None` = settled or absent; at most one of the two runs at a time.
+    shape_tween: Option<ShapeTween>,
     /// The pill squash/stretch spring. Ported from the host's animation
     /// thread into the compositor: integrating here keeps the animation
     /// phase-aligned with the render loop (and paced to composition via the
@@ -337,6 +345,7 @@ impl D3D11Compositor {
             pill_scale_y: 1.0,
             shape_transform: [1.0, 1.0, 0.0, 0.0],
             shape_spring: None,
+            shape_tween: None,
             pill_spring: None,
             spring_last_frame: Instant::now(),
             crop_constants,

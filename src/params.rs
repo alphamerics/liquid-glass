@@ -155,6 +155,17 @@ pub struct GlassShaderParams {
     /// unless the shape kind is 2; zero-weight or zero-radius balls never
     /// contribute.
     pub metaballs: [[f32; 4]; 6],
+    /// Per-ball shape rows for the metaball field (kind 2): up to six, each
+    /// `(exponent, extentX, extentY, spare)` in shape-region units — the
+    /// superellipse each ball's signed distance evaluates. `exponent` 2 with
+    /// equal extents is the plain circle (the shader's point-distance fast
+    /// path); unequal extents make the ball an ellipse, higher exponents
+    /// squircles/boxes. The stamped extents arrive pre-folded with the
+    /// ball's weight (`weight^(1/tension)`), exactly like the effective
+    /// radius, so an isolated shaped ball surfaces on its own silhouette
+    /// scaled by the weight. Inert unless the shape kind is 2; inactive rows
+    /// are never read (the ball count bounds the loop).
+    pub metaball_shapes: [[f32; 4]; 6],
     /// Cross-surface territory clip for SHARED metaball fields: (own ball
     /// index, clip enabled, first foreign index, unused). When enabled, the
     /// surface renders the field only where its own ball's contribution is
@@ -240,6 +251,9 @@ impl Default for GlassShaderParams {
             shape_meta: [0.0, 2.0, 0.0, 0.0],
             // No metaballs by default: every surface draws its own preset.
             metaballs: [[0.0; 4]; 6],
+            // No ball shapes by default: the rows are never read while the
+            // ball count is 0 (the shape kind is not 2).
+            metaball_shapes: [[0.0; 4]; 6],
             // No territory clip by default: single-surface fields render whole.
             metaball_own: [0.0; 4],
         }
@@ -266,14 +280,22 @@ impl Default for GlassShape {
     }
 }
 
-/// One metaball of a [`MetaballField`]: `(cx, cy, radius, weight)` in
-/// shape-region units (origin at the region's center, +y down, one unit =
-/// the region's height, x scaled by the region's aspect).
-pub type Metaball = [f32; 4];
+/// One metaball of a [`MetaballField`]: `(cx, cy, extentX, extentY, weight,
+/// exponent)` in shape-region units (origin at the region's center, +y down,
+/// one unit = the region's height, x scaled by the region's aspect). The
+/// extents are the ball's superellipse silhouette half-extents; `exponent` 2
+/// with equal extents is the plain circle (the classic metaball), any other
+/// exponent or unequal extents shapes the ball (exponent 2 with unequal
+/// extents is an ellipse, 4..6 the iOS-style squircle, higher approaches a
+/// box). The ball's merge influence scale derives from the extents (their
+/// smaller one), and the weight scales the whole silhouette
+/// (`weight^(1/tension)`), exactly like the classic circle field.
+pub type Metaball = [f32; 6];
 
-/// A surface's metaball field: up to six circles that blend into one liquid
-/// blob (the classic inverse-square isopotential, generalized by a tension
-/// exponent). A count of 0 disables the field — the surface draws its own
+/// A surface's metaball field: up to six balls (circles or superellipses)
+/// that blend into one liquid blob (the classic inverse-square isopotential,
+/// generalized by a tension exponent, evaluated over each ball's own signed
+/// distance). A count of 0 disables the field — the surface draws its own
 /// shape preset instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MetaballField {
@@ -290,7 +312,7 @@ pub struct MetaballField {
 impl Default for MetaballField {
     fn default() -> Self {
         Self {
-            balls: [[0.0; 4]; 6],
+            balls: [[0.0; 6]; 6],
             count: 0,
             tension: 2.0,
         }

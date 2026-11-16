@@ -2,13 +2,13 @@
 //! shape preset and region, shape-rect canvases, metaball fields, and the
 //! params stamping/uploading all of that rides on.
 
+use std::time::Duration;
 
-use crate::params::{
-    GlassShaderParams, GlassShape, MetaballField,
-};
+use crate::params::{GlassShaderParams, GlassShape, MetaballField};
 use crate::shared::engine;
+use crate::surface::D3D11Compositor;
 
-use super::{GlassSurface, metaball_effective_radii, scale_texel_params};
+use super::{metaball_effective_rows, scale_texel_params, GlassSurface};
 impl GlassSurface {
     /// Replaces every shader float live; takes effect on the next frame.
     /// The surface's own shape stamp (shape region + shape preset) rides on
@@ -146,6 +146,111 @@ impl GlassSurface {
         zeta: f64,
         restitution: f32,
     ) -> Result<(), String> {
+        self.retarget_shape_rect(rect, corner_radius_px, |compositor, initial| {
+            compositor.begin_shape_transform(initial, omega, zeta, restitution);
+        })
+    }
+
+    /// The bezier-eased counterpart to
+    /// [`GlassSurface::set_shape_rect_px_animated`]: the drawn shape glides
+    /// into the new rect paced by a CSS cubic-bezier curve
+    /// (`[x1, y1, x2, y2]` control points) over `duration_secs`, after
+    /// `delay_secs`. Deterministic endpoints instead of a spring: the
+    /// motion lands exactly on the target when the clock runs out, and
+    /// mid-flight retargets restart from the live visual value (CSS
+    /// transition semantics) with no velocity carry-over.
+    pub fn set_shape_rect_px_eased(
+        &mut self,
+        rect: [f32; 4],
+        corner_radius_px: f32,
+        duration_secs: f32,
+        easing: [f32; 4],
+        delay_secs: f32,
+    ) -> Result<(), String> {
+        self.retarget_shape_rect(rect, corner_radius_px, |compositor, initial| {
+            compositor.begin_shape_tween(
+                initial,
+                [1.0, 1.0, 0.0, 0.0],
+                Duration::from_secs_f32(delay_secs.max(0.0)),
+                Duration::from_secs_f32(duration_secs.max(1e-3)),
+                easing,
+            );
+        })
+    }
+
+    /// Sets the SHAPE TRANSFORM instantly, with no animation: the drawn
+    /// shape sits exactly at `(scale_x, scale_y, offset_x, offset_y)`
+    /// (shape-region units, bottom-center anchor; `(1, 1, 0, 0)` is the
+    /// identity) from the next frame on. Cancels any running shape
+    /// animation. The instant counterpart of
+    /// [`GlassSurface::set_shape_transform_eased`].
+    pub fn set_shape_transform(&mut self, value: [f32; 4]) -> Result<(), String> {
+        Self::with_context(|context| {
+            let mut compositor = self
+                .compositor
+                .lock()
+                .expect("D3D11 compositor lock poisoned");
+            compositor.set_shape_transform_direct(value);
+            let mut params = self.shader_params;
+            self.stamp_shape(&mut params);
+            compositor.set_params(context, params)
+        })
+    }
+
+    /// Animates the SHAPE TRANSFORM itself to an arbitrary target — the
+    /// CSS `transform` + `transition` model: the drawn shape eases from
+    /// wherever it visually is into `(scale_x, scale_y, offset_x,
+    /// offset_y)` (shape-region units, anchored to the shape's
+    /// bottom-center; `(1, 1, 0, 0)` is the identity) over `duration_secs`
+    /// paced by the cubic-bezier control points `easing` (`[x1, y1, x2,
+    /// y2]`), after `delay_secs`. The target PERSISTS: at rest the
+    /// transform holds `to`, unlike the rect-glide variants whose
+    /// animations dissolve into the identity. Retargets restart from the
+    /// live value; a running spring is replaced.
+    pub fn set_shape_transform_eased(
+        &mut self,
+        to: [f32; 4],
+        duration_secs: f32,
+        easing: [f32; 4],
+        delay_secs: f32,
+    ) -> Result<(), String> {
+        Self::with_context(|context| {
+            let mut compositor = self
+                .compositor
+                .lock()
+                .expect("D3D11 compositor lock poisoned");
+            // CSS retarget semantics: the tween starts from wherever the
+            // transform stands right now (the previous animation's live
+            // value, or the identity at rest).
+            let from = compositor.shape_transform();
+            compositor.begin_shape_tween(
+                from,
+                to,
+                Duration::from_secs_f32(delay_secs.max(0.0)),
+                Duration::from_secs_f32(duration_secs.max(1e-3)),
+                easing,
+            );
+            // The transform is compositor-owned (stamped into every
+            // upload), so the params re-push only re-arms the surface's
+            // dirty state; the tween's own steps carry the values from
+            // here on.
+            let mut params = self.shader_params;
+            self.stamp_shape(&mut params);
+            compositor.set_params(context, params)
+        })
+    }
+
+    /// The shared body of the two animated rect setters: stores the target
+    /// rect (clamped exactly like the instant path), recomputes the
+    /// current visual rect's initial conditions relative to the NEW region
+    /// and hands them to `begin` on the compositor (the spring's or the
+    /// tween's start).
+    fn retarget_shape_rect(
+        &mut self,
+        rect: [f32; 4],
+        corner_radius_px: f32,
+        begin: impl FnOnce(&mut D3D11Compositor, [f32; 4]),
+    ) -> Result<(), String> {
         let surface_w = self.surface_width_px.max(1.0);
         let surface_h = self.surface_height_px.max(1.0);
         let previous = self
@@ -173,8 +278,8 @@ impl GlassSurface {
             // Store the target rect (clamped exactly like the instant path).
             self.store_shape_rect(rect, corner_radius_px);
             let target = self.shape_rect_px.expect("shape rect was just stored");
-            // The spring's start, expressed relative to the NEW region: the
-            // visual size as a fraction of the target's, and the anchor
+            // The animation's start, expressed relative to the NEW region:
+            // the visual size as a fraction of the target's, and the anchor
             // displacement in target-region units.
             let region_h = target[3].max(1.0);
             let initial = [
@@ -187,10 +292,10 @@ impl GlassSurface {
                 .compositor
                 .lock()
                 .expect("D3D11 compositor lock poisoned");
-            compositor.begin_shape_transform(initial, omega, zeta, restitution);
+            begin(&mut compositor, initial);
             // The params carry the new shape region; the compositor stamps
             // the just-set transform over its stored value, so the upload
-            // and the spring start agree exactly.
+            // and the animation start agree exactly.
             let mut params = self.shader_params;
             self.stamp_shape(&mut params);
             compositor.set_params(context, params)
@@ -209,11 +314,14 @@ impl GlassSurface {
     }
 
     /// Toggles the surface's drawn shape to (or from) a liquid metaball
-    /// field. Each ball is `(cx, cy, radius, weight)` in shape-region
-    /// units — the same space [`GlassShaderParams::reveal_origin`] uses
-    /// (origin at the region's center, +y down, one unit = the region's
-    /// height). An empty slice turns the field off and restores the
-    /// surface's own shape preset.
+    /// field. Each ball is `(cx, cy, extentX, extentY, weight, exponent)` in
+    /// shape-region units — the same space [`GlassShaderParams::reveal_origin`]
+    /// uses (origin at the region's center, +y down, one unit = the region's
+    /// height). Exponent 2 with equal extents is the classic circle ball;
+    /// any other exponent or unequal extents shapes the ball's silhouette
+    /// (an ellipse, squircle or box-like superellipse that blends into the
+    /// field exactly like a circle). An empty slice turns the field off and
+    /// restores the surface's own shape preset.
     ///
     /// The field REPLACES the drawn silhouette while active: only surfaces
     /// running their own metaball fields look blob-like; a plain shape and
@@ -230,7 +338,7 @@ impl GlassSurface {
     /// field renders. For a surface that shares the field with other
     /// metaball surfaces, use [`GlassSurface::set_metaballs_field`], which
     /// also tiles the merged blob across the surfaces.
-    pub fn set_metaballs(&mut self, balls: &[[f32; 4]], tension: f32) -> Result<(), String> {
+    pub fn set_metaballs(&mut self, balls: &[[f32; 6]], tension: f32) -> Result<(), String> {
         self.set_metaballs_field(balls, tension, None)
     }
 
@@ -244,7 +352,7 @@ impl GlassSurface {
     /// form; a foreign-dominated pixel would otherwise go dark).
     pub fn set_metaballs_field(
         &mut self,
-        balls: &[[f32; 4]],
+        balls: &[[f32; 6]],
         tension: f32,
         own_index: Option<usize>,
     ) -> Result<(), String> {
@@ -253,9 +361,9 @@ impl GlassSurface {
             ..Default::default()
         };
         for ball in balls.iter().take(field.balls.len()) {
-            // Degenerate balls (no radius or no weight) never contribute to
+            // Degenerate balls (no extent or no weight) never contribute to
             // the potential; skip them instead of counting hollow balls.
-            if ball[2] <= 0.0 || ball[3] <= 0.0 {
+            if ball[2] <= 0.0 || ball[3] <= 0.0 || ball[4] <= 0.0 {
                 continue;
             }
             field.balls[field.count] = *ball;
@@ -274,11 +382,12 @@ impl GlassSurface {
     }
 
     /// Like [`GlassSurface::set_metaballs`], but the balls arrive in
-    /// surface-relative physical pixels — `(x, y, radius, weight)`, origin
-    /// top-left — the natural unit for hosts that position balls from DOM
-    /// geometry. Converted into shape-region units through the active shape
-    /// rect (the whole surface when it is the identity).
-    pub fn set_metaballs_px(&mut self, balls_px: &[[f32; 4]], tension: f32) -> Result<(), String> {
+    /// surface-relative physical pixels — `(x, y, extentX, extentY, weight,
+    /// exponent)`, origin top-left — the natural unit for hosts that
+    /// position balls from DOM geometry. Converted into shape-region units
+    /// through the active shape rect (the whole surface when it is the
+    /// identity).
+    pub fn set_metaballs_px(&mut self, balls_px: &[[f32; 6]], tension: f32) -> Result<(), String> {
         self.set_metaballs_field_px(balls_px, tension, None)
     }
 
@@ -287,7 +396,7 @@ impl GlassSurface {
     /// [`GlassSurface::set_metaballs_px`].
     pub fn set_metaballs_field_px(
         &mut self,
-        balls_px: &[[f32; 4]],
+        balls_px: &[[f32; 6]],
         tension: f32,
         own_index: Option<usize>,
     ) -> Result<(), String> {
@@ -298,14 +407,16 @@ impl GlassSurface {
         let region_h = region_h.max(1.0);
         let center_x = region_x + region_w * 0.5;
         let center_y = region_y + region_h * 0.5;
-        let balls: Vec<[f32; 4]> = balls_px
+        let balls: Vec<[f32; 6]> = balls_px
             .iter()
             .map(|ball| {
                 [
                     (ball[0] - center_x) / region_h,
                     (ball[1] - center_y) / region_h,
                     ball[2] / region_h,
-                    ball[3],
+                    ball[3] / region_h,
+                    ball[4],
+                    ball[5],
                 ]
             })
             .collect();
@@ -328,9 +439,10 @@ impl GlassSurface {
     /// Writes the surface's shape state into a params copy (the cbuffer's
     /// shape rows: the shape region, the own shape preset and the metaball
     /// field). An active metaball field replaces the preset: kind 2, with
-    /// the ball count and tension riding in the meta's spare slots and each
-    /// ball's weight pre-folded into its effective radius (see
-    /// [`metaball_effective_radii`]).
+    /// the ball count and tension riding in the meta's spare slots and the
+    /// potential + shape rows stamped by [`metaball_effective_rows`] (each
+    /// ball's weight pre-folded into its effective radius and silhouette
+    /// extents).
     pub(super) fn stamp_shape(&self, params: &mut GlassShaderParams) {
         params.shape_region = self.shape_region;
         params.shape_meta = if self.metaballs.count > 0 {
@@ -346,17 +458,17 @@ impl GlassSurface {
                 GlassShape::Superellipse { exponent } => [1.0, exponent.max(1.0), 0.0, 0.0],
             }
         };
-        params.metaballs = metaball_effective_radii(
+        let (rows, shapes) = metaball_effective_rows(
             self.metaballs.balls,
             self.metaballs.count,
             self.metaballs.tension,
         );
+        params.metaballs = rows;
+        params.metaball_shapes = shapes;
         // The territory clip arms only when there are foreign balls after
         // the own one (a single-ball or whole-field surface renders all).
         params.metaball_own = match self.metaball_own_index {
-            Some(own) if own + 1 < self.metaballs.count => {
-                [own as f32, 1.0, (own + 1) as f32, 0.0]
-            }
+            Some(own) if own + 1 < self.metaballs.count => [own as f32, 1.0, (own + 1) as f32, 0.0],
             _ => [0.0; 4],
         };
     }

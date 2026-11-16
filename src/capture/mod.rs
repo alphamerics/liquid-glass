@@ -22,6 +22,7 @@ mod frame;
 mod monitor;
 
 pub(crate) use feed::CaptureFeed;
+pub(crate) use monitor::request_borderless_capture;
 
 const FRAME_POOL_BUFFERS: i32 = 2;
 

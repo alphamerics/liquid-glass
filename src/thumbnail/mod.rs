@@ -19,8 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-
-
 const THUMBNAIL_HLSL: &str = include_str!("../thumbnail.hlsl");
 const FRAME_POOL_BUFFERS: i32 = 2;
 /// The render tick. Frames are only presented when the capture moves or a

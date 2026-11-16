@@ -1,19 +1,15 @@
 //! Keeping the native surface aligned with its host window: bounds sync,
 //! anchors, and the translation path the window manager drives.
 
-
 use windows::Win32::Foundation::HWND;
 
+use crate::params::{BackdropSource, SurfaceAnchor};
 use crate::surface::geometry::{
     anchor_rect, height, overlay_bounds, primary_monitor_bounds, width, window_frame_rect,
 };
 use crate::surface::window::{
-    move_above_host, move_beneath_host,
-    stack_above_host, stack_beneath_host, translate_surface_window,
-};
-use crate::params::{
-    BackdropSource,
-    SurfaceAnchor,
+    move_above_host, move_beneath_host, stack_above_host, stack_beneath_host,
+    translate_surface_window,
 };
 
 use super::GlassSurface;

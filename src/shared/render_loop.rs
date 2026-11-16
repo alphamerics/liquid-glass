@@ -139,6 +139,11 @@ pub(crate) fn spawn_render_loop(
         let mut local_seen_version: HashMap<isize, u64> = HashMap::new();
         let mut local_idle_ticks: HashMap<isize, u32> = HashMap::new();
         let mut local_restarts: HashMap<isize, RestartBackoff> = HashMap::new();
+        // Present-failure logging: a persistent failure repeats every tick,
+        // so a streak logs once and stays muted until a present succeeds
+        // again. Only a VERIFIED device loss stops the engine — a
+        // transient present error must never permanently freeze the glass.
+        let mut present_error_logged = false;
         // When any surface animates, the tick waits for the desktop
         // compositor (DwmFlush) instead of the fixed idle interval, so
         // animation presents land phase-aligned with composition — the
@@ -295,12 +300,13 @@ pub(crate) fn spawn_render_loop(
             // window's frame version). Animations and dirty params still
             // request frames through `wants_frame` regardless.
             let mut any_animating = false;
+            let mut present_error: Option<String> = None;
             for (_, compositor, route) in &engine.surfaces {
                 let Ok(mut compositor) = compositor.lock() else {
                     continue;
                 };
                 any_animating |= compositor.is_animating();
-                let device_lost = match route.source {
+                match route.source {
                     BackdropSource::Global => {
                         let present_signal = if broker_attached {
                             frame_changed
@@ -308,11 +314,11 @@ pub(crate) fn spawn_render_loop(
                             version_changed
                         };
                         if compositor.wants_frame(present_signal) {
-                            engine.backdrop.as_ref().map_or(false, |backdrop| {
-                                failed_present(&mut compositor, &engine.context, backdrop)
-                            })
-                        } else {
-                            false
+                            if let Some(backdrop) = engine.backdrop.as_ref() {
+                                present_error = present_error.or_else(|| {
+                                    failed_present(&mut compositor, &engine.context, backdrop)
+                                });
+                            }
                         }
                     }
                     BackdropSource::Local => {
@@ -323,30 +329,42 @@ pub(crate) fn spawn_render_loop(
                         let changed =
                             fresh != local_seen_version.get(&window).copied().unwrap_or(0);
                         if compositor.wants_frame(changed) {
-                            match local_backdrop(&engine, window) {
-                                Some(backdrop) => {
-                                    // `failed_present` needs a `&mut
-                                    // compositor` while `backdrop` borrows
-                                    // `engine`: clone the cheap COM view
-                                    // out of the engine borrow first.
-                                    let backdrop = backdrop.clone();
+                            if let Some(backdrop) = local_backdrop(&engine, window) {
+                                // `failed_present` needs a `&mut
+                                // compositor` while `backdrop` borrows
+                                // `engine`: clone the cheap COM view
+                                // out of the engine borrow first.
+                                let backdrop = backdrop.clone();
+                                present_error = present_error.or_else(|| {
                                     failed_present(&mut compositor, &engine.context, &backdrop)
-                                }
-                                None => false,
+                                });
                             }
-                        } else {
-                            false
                         }
                     }
-                };
-                if device_lost {
-                    eprintln!(
-                        "Glassbar glass device removed (driver reset); \
-                         stopping the glass engine"
-                    );
-                    engine.render_running.store(false, Ordering::Relaxed);
-                    break 'main;
                 }
+            }
+            match present_error {
+                Some(error) => {
+                    if !present_error_logged {
+                        // A failed present means the surface silently never
+                        // appears (hosts gate reveals on `has_presented`);
+                        // surfacing the error is the only way to see it.
+                        eprintln!(
+                            "Glassbar surface render failed (further failures muted until \
+                             one succeeds): {error}"
+                        );
+                        present_error_logged = true;
+                    }
+                    if device_lost(&engine.device) {
+                        eprintln!(
+                            "Glassbar glass device removed (driver reset); \
+                             stopping the glass engine"
+                        );
+                        engine.render_running.store(false, Ordering::Relaxed);
+                        break 'main;
+                    }
+                }
+                None => present_error_logged = false,
             }
             // Everything that needed the newest frame version saw it; the
             // next versions become the following tick's fresh signal.
@@ -486,22 +504,17 @@ pub(crate) fn spawn_render_loop(
     });
 }
 
-/// Runs one compositor present for the routed backdrop and reports whether
-/// the failure signals a lost device (a driver reset — common on saturated
-/// integrated GPUs — fails every later call: stopping the loop lets the
-/// driver recover instead of crash-looping it. The glass freezes on its
-/// last frame until the app restarts).
+/// Runs one compositor present for the routed backdrop and returns the
+/// failure, if any. The CALLER decides what a failure means: only a real
+/// device loss (checked against the device) stops the engine — a transient
+/// present error must not permanently freeze the glass.
 fn failed_present(
     compositor: &mut crate::surface::D3D11Compositor,
     context: &ID3D11DeviceContext,
     backdrop: &Backdrop,
-) -> bool {
-    if let Err(error) = compositor.present(context, backdrop) {
-        // A failed present means the surface silently never appears (hosts
-        // gate reveals on `has_presented`); surfacing the error here is
-        // the only way to see it.
-        eprintln!("Glassbar surface render failed: {error}");
-        return true;
+) -> Option<String> {
+    match compositor.present(context, backdrop) {
+        Ok(()) => None,
+        Err(error) => Some(error),
     }
-    false
 }

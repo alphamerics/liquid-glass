@@ -2,10 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
-use windows::Graphics::{
-    DirectX::Direct3D11::IDirect3DDevice,
-    SizeInt32,
-};
+use windows::Graphics::{DirectX::Direct3D11::IDirect3DDevice, SizeInt32};
 use windows::Win32::Foundation::{BOOL, HWND};
 use windows::Win32::Graphics::{
     DirectComposition::{
@@ -13,7 +10,8 @@ use windows::Win32::Graphics::{
     },
     Dxgi::{
         Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-        CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS,
+        DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD,
         DXGI_USAGE_RENDER_TARGET_OUTPUT,
     },
 };
@@ -22,11 +20,11 @@ use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDev
 use crate::shared::{compiled_shader, constant_buffer, create_linear_clamp_sampler};
 use crate::surface::create_d3d11_device;
 
-use super::render::render_loop;
-use super::THUMBNAIL_HLSL;
-use super::ThumbnailSurface;
 use super::capture::{measure_window, start_capture};
+use super::render::render_loop;
 use super::state::{AgileWinRTDevice, SendCore, ThumbConstants, ThumbCore};
+use super::ThumbnailSurface;
+use super::THUMBNAIL_HLSL;
 impl ThumbnailSurface {
     /// Creates the surface on `window`. The window's current size is adopt-
     /// ed; call [`ThumbnailSurface::sync_window_size`] after moving it.
@@ -192,7 +190,7 @@ impl ThumbnailSurface {
         // it (deadlock / race, see Capture::drop).
         drop(old);
         if want {
-            self.attach_capture(target, epoch)?;
+            self.attach_capture(target, epoch);
         }
         Ok(())
     }
@@ -284,11 +282,10 @@ impl ThumbnailSurface {
         // WinRT teardown outside the core lock (see Capture::drop).
         drop(old);
         if let Some(target) = want {
-            // The capture is created without the core lock (the frame callback
-            // re-enters it as soon as the session runs — see set_source).
-            if let Err(error) = self.attach_capture(target, self.current_epoch()) {
-                eprintln!("Glassbar thumbnail capture failed: {error}");
-            }
+            // The capture is created on a detached thread (see
+            // `attach_capture`): no WGC or COM activation work on the
+            // caller's thread.
+            self.attach_capture(target, self.current_epoch());
         }
     }
 
@@ -301,23 +298,50 @@ impl ThumbnailSurface {
             .unwrap_or(u64::MAX)
     }
 
-    /// Starts a WGC capture of `target` under `epoch` and attaches it only
-    /// if the core's state has not moved on (a newer retarget or hide wins).
-    fn attach_capture(&self, target: isize, epoch: u64) -> Result<(), String> {
-        let capture = start_capture(&self.core, target, epoch)?;
-        let mut core = self
-            .core
-            .lock()
-            .map_err(|_| "thumbnail lock poisoned".to_owned())?;
-        if core.capture_epoch == epoch && core.visible && core.source == target {
-            core.feed = Some(capture);
-            Ok(())
-        } else {
-            // Superseded while the session was starting (or the surface hid):
-            // discard. The teardown must not run under the lock.
-            drop(core);
-            drop(capture);
-            Ok(())
-        }
+    /// Starts a WGC capture of `target` under `epoch` on a DETACHED thread
+    /// and attaches it only if the core's state has not moved on (a newer
+    /// retarget or hide wins).
+    ///
+    /// Session creation must never run on the host's main thread: WGC's
+    /// object creation and the COM activation it performs trigger
+    /// delay-loads (loader-lock traffic), and contending for the loader
+    /// lock against any other in-flight WGC operation — a wedged capture
+    /// pipeline holds it — freezes the whole app (the hang dump showed the
+    /// main thread parked in a loader wait while ~100 capture teardowns
+    /// piled up). The epoch/visible/source checks below, under the core
+    /// lock, still gate the attach wherever it lands; a stale session is
+    /// discarded through the reaper.
+    fn attach_capture(&self, target: isize, epoch: u64) {
+        let core = SendCore(Arc::clone(&self.core));
+        std::thread::spawn(move || {
+            let capture = match start_capture(&core, target, epoch) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    eprintln!("Glassbar thumbnail capture failed: {error}");
+                    return;
+                }
+            };
+            let Ok(mut core) = core.0.lock() else {
+                // Poisoned core: a panic elsewhere already doomed the
+                // process (the release profile aborts); discard quietly.
+                drop(capture);
+                return;
+            };
+            if core.capture_epoch == epoch && core.visible && core.source == target {
+                core.feed = Some(capture);
+            } else {
+                // Superseded while the session was starting (or the surface
+                // hid): discard. Bump the epoch FIRST — the callback fences
+                // on it, and a mismatch here may come from
+                // `visible`/`source` alone (which do not always move the
+                // epoch), so a callback dispatched under this capture's
+                // epoch must be locked out of the pool before the teardown
+                // closes it. The teardown itself must not run under the
+                // lock.
+                core.capture_epoch += 1;
+                drop(core);
+                drop(capture);
+            }
+        });
     }
 }

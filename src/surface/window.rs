@@ -3,10 +3,10 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, GetWindow, GetWindowLongW, GetWindowRect, RegisterClassW,
         SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-        GW_HWNDPREV, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        GW_HWNDPREV, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA, SWP_ASYNCWINDOWPOS,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     },
 };
 
@@ -228,7 +228,12 @@ pub(super) unsafe fn stack_beneath_host(
 /// `SetWindowPos` targeting a window owned by another thread blocks until
 /// that thread pumps messages — and that thread (the host's command
 /// handler) may itself be waiting on a lock the caller holds. Collect the
-/// targets, DROP every lock, then move the windows.
+/// targets, DROP every lock, then move the windows. The move itself is
+/// posted ASYNCWINDOWPOS when the caller does not own the window: a
+/// synchronous sent request would also wedge the owner's own same-thread
+/// window operations against this pending one (the auto-hide slide vs the
+/// main thread's re-anchor deadlocked exactly that way), and a slide step
+/// has no use for waiting on the compositor's acknowledgment anyway.
 pub fn translate_surface_window(hwnd_addr: isize, dy: i32) -> Result<(), String> {
     if dy == 0 {
         return Ok(());
@@ -245,7 +250,7 @@ pub fn translate_surface_window(hwnd_addr: isize, dy: i32) -> Result<(), String>
             rect.top + dy,
             0,
             0,
-            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
         )
         .map_err(|error| format!("Could not slide the GPU surface: {error}"))?;
     }

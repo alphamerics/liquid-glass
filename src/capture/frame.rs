@@ -17,11 +17,15 @@ pub(super) fn scale_size(size: SizeInt32) -> SizeInt32 {
 
 /// The shared capture frame texture plus its shader view, created together:
 /// every consumer samples the same view for the texture's whole lifetime
-/// (recreated only when the monitor's size changes).
+/// (recreated only when the monitor's size changes). Returns a `Result`
+/// rather than panicking: this runs on the WGC callback thread, and the
+/// release profile aborts the whole process on any panic — a D3D failure
+/// (a driver reset, most commonly) must degrade to a skipped frame
+/// instead.
 pub(super) fn create_frame_texture(
     device: &ID3D11Device,
     size: SizeInt32,
-) -> (ID3D11Texture2D, ID3D11ShaderResourceView) {
+) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView), String> {
     let mut texture = None;
     unsafe {
         device.CreateTexture2D(
@@ -44,17 +48,16 @@ pub(super) fn create_frame_texture(
             Some(&mut texture),
         )
     }
-    .map_err(|error| format!("Could not create the shared capture frame texture: {error}"))
-    .expect("Could not create the shared capture frame texture");
+    .map_err(|error| format!("Could not create the shared capture frame texture: {error}"))?;
     let texture = texture.expect("D3D11 shared capture frame texture missing");
     let mut view = None;
     unsafe {
         device
             .CreateShaderResourceView(&texture, None, Some(&mut view))
-            .expect("Could not create the shared capture frame view");
+            .map_err(|error| format!("Could not create the shared capture frame view: {error}"))?;
     }
-    (
+    Ok((
         texture,
         view.expect("D3D11 shared capture frame view missing"),
-    )
+    ))
 }

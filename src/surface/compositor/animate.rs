@@ -1,19 +1,19 @@
 //! Everything the compositor ANIMATES on its own: the reveal progress, the
 //! spring-integrated pill squash/stretch and shape transform, the pointer
 //! velocity input and the params stamping/uploading all of it rides on.
-use windows::Win32::Foundation::POINT;
-use windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext;
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-use std::time::Instant;
 use super::super::geometry::{primary_monitor_bounds, source_rect_constants};
+use super::easing::{CubicBezier, ShapeTween};
 use super::spring::TransformSpring;
 use crate::params::{GlassShaderParams, RevealAnimation};
 use crate::SourceRectConstants;
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext;
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 use super::D3D11Compositor;
 
 impl D3D11Compositor {
-
     /// Starts (or reverses) the reveal animation with the given configuration.
     pub fn set_reveal(&mut self, open: bool, reveal: RevealAnimation) {
         let target = if open { 1.0 } else { 0.0 };
@@ -119,10 +119,11 @@ impl D3D11Compositor {
         }
     }
 
-    /// Integrates the compositor-owned springs (the pill squash/stretch and
-    /// the shape transform's pursuit) with the frame's real dt, then uploads
-    /// the params once when any value moved this frame. Runs every present;
-    /// with no active spring it only advances the shared wall clock.
+    /// Integrates the compositor-owned animations (the pill squash/stretch
+    /// spring, the shape transform's pursuit spring and its bezier tween)
+    /// with the frame's real dt, then uploads the params once when any
+    /// value moved this frame. Runs every present; with no active
+    /// animation it only advances the shared wall clock.
     pub(super) fn update_springs(&mut self, context: &ID3D11DeviceContext) {
         let now = Instant::now();
         let dt = now
@@ -148,6 +149,21 @@ impl D3D11Compositor {
             self.shape_transform = spring.value;
             if settled {
                 self.shape_spring = None;
+            }
+            changed |= self
+                .shape_transform
+                .iter()
+                .zip(previous.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-5);
+        }
+        // The time-based tween shares the spring's upload budget: both
+        // integrate against the same frame clock and stamp the same
+        // compositor-owned transform.
+        if let Some(tween) = &self.shape_tween {
+            let previous = self.shape_transform;
+            self.shape_transform = tween.value_at(now);
+            if tween.progress(now) >= 1.0 {
+                self.shape_tween = None;
             }
             changed |= self
                 .shape_transform
@@ -308,6 +324,10 @@ impl D3D11Compositor {
         zeta: f64,
         restitution: f32,
     ) {
+        // At most one shape animation runs at a time: a spring start
+        // replaces a running tween (the spring is the stateful pursuit;
+        // the tween the deterministic glide).
+        self.shape_tween = None;
         let mut velocity = [0.0f32; 4];
         if let Some(spring) = &self.shape_spring {
             for axis in 0..4 {
@@ -336,12 +356,50 @@ impl D3D11Compositor {
         ));
     }
 
+    /// Starts (or retargets) the shape transform's TIME-BASED tween: the
+    /// transform glides from `from` to `to` over `duration` after `delay`,
+    /// paced by a cubic-bezier curve (`easing` = the `[x1, y1, x2, y2]`
+    /// control points) — CSS `transition` semantics. `from` is normally
+    /// the live transform (a retarget mid-flight restarts from wherever
+    /// the previous animation stands, so a stream of targets reads as one
+    /// continuous motion); a running spring is replaced.
+    pub fn begin_shape_tween(
+        &mut self,
+        from: [f32; 4],
+        to: [f32; 4],
+        delay: Duration,
+        duration: Duration,
+        easing: [f32; 4],
+    ) {
+        // At most one shape animation runs at a time: a tween start
+        // replaces a running spring.
+        self.shape_spring = None;
+        self.shape_tween = Some(ShapeTween::new(
+            from,
+            to,
+            delay,
+            duration,
+            CubicBezier::from_points(easing),
+        ));
+    }
+
     /// Cancels the shape transform's spring and snaps the transform to its
     /// identity: the drawn shape sits exactly where the shape region puts
-    /// it (the instant-resize path).
+    /// it (the instant-resize path). A running tween is cancelled too.
     pub fn cancel_shape_transform(&mut self) {
         self.shape_spring = None;
+        self.shape_tween = None;
         self.shape_transform = [1.0, 1.0, 0.0, 0.0];
+    }
+
+    /// Sets the shape transform directly, with no animation: cancels any
+    /// running spring or tween. The instant counterpart of
+    /// [`Self::begin_shape_tween`] (a freshly created surface snapping to
+    /// its menu's held transform).
+    pub fn set_shape_transform_direct(&mut self, value: [f32; 4]) {
+        self.shape_spring = None;
+        self.shape_tween = None;
+        self.shape_transform = value;
     }
 
     /// Kicks the pill squash/stretch spring with explicit initial

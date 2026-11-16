@@ -1,14 +1,7 @@
-
-use windows::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::DestroyWindow,
-};
+use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::DestroyWindow};
 
 use super::SharedCompositor;
-use crate::params::{
-    BackdropSource, GlassShaderParams, GlassShape, MetaballField,
-    SurfaceAnchor,
-};
+use crate::params::{BackdropSource, GlassShaderParams, GlassShape, MetaballField, SurfaceAnchor};
 use crate::shared::engine;
 
 /// DXGI D3D11 presentation target positioned beneath (or above) a host
@@ -57,22 +50,33 @@ pub struct GlassSurface {
 
 unsafe impl Send for GlassSurface {}
 
-/// Folds each active ball's weight into its radius: the field's contribution
-/// uses the effective radius `radius * weight^(1/tension)`, a per-ball
-/// CONSTANT that would otherwise be recomputed per pixel inside the shader's
-/// ball loop (six pow calls per evaluation). The stamped rows carry the
-/// effective radius in slot 2; slot 3 keeps the raw weight as inert layout
-/// parity.
-pub(crate) fn metaball_effective_radii(
-    mut balls: [[f32; 4]; 6],
+/// Folds each active ball's weight into its influence radius and silhouette
+/// extents, and splits the field into the shader's two stamped row sets:
+/// the potential rows (`(cx, cy, effectiveRadius, weight)`, slot 3 inert
+/// layout parity) and the shape rows (`(exponent, extentX, extentY, 0)`).
+/// The field's contribution uses the effective radius
+/// `min(extents) * weight^(1/tension)` and the folded extents — per-ball
+/// CONSTANTS that would otherwise be recomputed per pixel inside the
+/// shader's ball loop. An exponent-2 ball with equal extents stamps shape
+/// rows the shader dispatches through its circle fast path; a shaped ball
+/// stamps its superellipse (exponent 2 with unequal extents is an ellipse).
+/// Inactive rows stamp zero (never read — the ball count bounds the loop).
+pub(crate) fn metaball_effective_rows(
+    balls: [[f32; 6]; 6],
     count: usize,
     tension: f32,
-) -> [[f32; 4]; 6] {
+) -> ([[f32; 4]; 6], [[f32; 4]; 6]) {
     let inv_tension = 1.0 / tension.max(1.0);
-    for ball in balls.iter_mut().take(count) {
-        ball[2] *= ball[3].powf(inv_tension);
+    let mut rows = [[0.0; 4]; 6];
+    let mut shapes = [[0.0; 4]; 6];
+    for (index, ball) in balls.iter().enumerate().take(count) {
+        let fold = ball[4].max(0.0).powf(inv_tension);
+        let extent_x = ball[2] * fold;
+        let extent_y = ball[3] * fold;
+        rows[index] = [ball[0], ball[1], extent_x.min(extent_y), ball[4]];
+        shapes[index] = [ball[5], extent_x, extent_y, 0.0];
     }
-    balls
+    (rows, shapes)
 }
 
 mod bounds;

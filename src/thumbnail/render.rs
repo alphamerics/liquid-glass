@@ -1,15 +1,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
+use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
-
-use super::TICK;
 use super::state::{SendCore, ThumbConstants, ThumbCore};
+use super::TICK;
 /// The render loop: presents one frame whenever the capture moved or a
 /// parameter changed; sleeps at `TICK` otherwise (and while hidden).
 pub(super) fn render_loop(core: SendCore, running: Arc<AtomicBool>) {
@@ -20,6 +21,21 @@ pub(super) fn render_loop(core: SendCore, running: Arc<AtomicBool>) {
             return;
         };
         if !core.visible {
+            seen_version = 0;
+            continue;
+        }
+        // NEVER present into a hidden window. The host hides the popup
+        // window BEFORE the surface worker marks the core invisible (the
+        // hide's window ops and the teardown are deliberately decoupled), so
+        // a capture frame arriving in that gap would otherwise be presented
+        // into an already-hidden window. A flip-model composition swap
+        // chain's Present BACKPRESSURES once the compositor stops consuming
+        // (a hidden window composes nothing): with only two buffers, a
+        // couple of un-consumed presents block `Present` forever — and this
+        // loop holds the core lock across it, wedging the worker's teardown
+        // (and every later hover) behind it. `IsWindowVisible` reads the
+        // style bits without sending messages, so it is safe cross-thread.
+        if !unsafe { IsWindowVisible(HWND(core.window as *mut _)) }.as_bool() {
             seen_version = 0;
             continue;
         }

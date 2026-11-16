@@ -12,13 +12,12 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
 
-use crate::shared::{Backdrop, CropConstants};
 use super::ACTIVE_CONTENT_WINDOW;
+use crate::shared::{Backdrop, CropConstants};
 
 use super::D3D11Compositor;
 
 impl D3D11Compositor {
-
     /// Composites this surface's frame from the shared blurred backdrop.
     /// The heavy blur runs once per capture frame in the engine; a present
     /// is one draw call (displace, tint, mask) plus the flip-model present.

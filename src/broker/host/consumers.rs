@@ -16,11 +16,11 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use super::publish::{SharedCell, SharedPair};
 use crate::broker::protocol::{
     ConsumerSlot, Manifest, ManifestView, CONSUMER_SLOTS, SLOT_REQUESTED, SLOT_SUPPLIED,
     SLOT_UNUSED,
 };
-use super::publish::{SharedCell, SharedPair};
 
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER)` — the kernel's answer
 /// when `OpenProcess` names a pid that no longer exists (any other

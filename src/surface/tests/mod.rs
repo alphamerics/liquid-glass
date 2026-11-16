@@ -52,10 +52,11 @@ fn source_rectangle_maps_overlay_into_primary_capture() {
 fn glass_shader_params_layout_matches_16_byte_constant_rows() {
     assert_eq!(
         size_of::<GlassShaderParams>(),
-        size_of::<[f32; 76]>(),
-        "GlassShaderParams must stay exactly nineteen 16-byte constant rows \
-         (35 core floats + one alignment filler + shape region + shape \
-         transform + shape meta + six metaball rows + the territory clip row)"
+        size_of::<[f32; 100]>(),
+        "GlassShaderParams must stay exactly twenty-five 16-byte constant \
+         rows (35 core floats + one alignment filler + shape region + shape \
+         transform + shape meta + six metaball rows + six ball shape rows + \
+         the territory clip row)"
     );
 }
 
@@ -63,16 +64,55 @@ mod metaball_field;
 mod metaball_seam_harness;
 
 #[test]
-fn metaball_effective_radii_fold_weight_into_radius_and_skip_inactive_rows() {
-    // The stamp the shader relies on: slot 2 becomes radius * weight^(1/n),
-    // inactive rows pass through untouched, and a sub-1 tension clamps to
-    // the field's >= 1 contract (weight^(1/1) = weight).
-    let balls = [[1.0, 2.0, 8.0, 4.0], [3.0, 4.0, 5.0, 1.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4]];
-    let stamped = super::glass::metaball_effective_radii(balls, 2, 2.0);
-    assert_eq!(stamped[0][2], 16.0, "weight 4 at tension 2 doubles the radius");
-    assert_eq!(stamped[1][2], 5.0, "weight 1 is an identity fold");
-    let clamped = super::glass::metaball_effective_radii(balls, 1, 0.5);
-    assert_eq!(clamped[0][2], 32.0, "tension clamps to 1 before the fold");
-    let untouched = super::glass::metaball_effective_radii(balls, 1, 2.0);
-    assert_eq!(untouched[1], balls[1], "rows past the count stay raw");
+fn metaball_effective_rows_fold_weight_and_stamp_shape_rows() {
+    // The stamp the shader relies on: the potential row's slot 2 becomes
+    // min(extents) * weight^(1/n), the shape rows carry the exponent and
+    // the weight-folded extents, and inactive rows stamp zero (the ball
+    // count bounds every shader loop, so they are never read).
+    let balls = [
+        [1.0, 2.0, 8.0, 4.0, 4.0, 2.0], // circle, weight 4: fold doubles it
+        [3.0, 4.0, 5.0, 5.0, 1.0, 5.0], // squircle, weight 1: identity fold
+        [5.0, 6.0, 6.0, 3.0, 1.0, 2.0], // ellipse: unequal extents, n = 2
+        [0.0; 6],
+        [0.0; 6],
+        [0.0; 6],
+    ];
+    let (rows, shapes) = super::glass::metaball_effective_rows(balls, 3, 2.0);
+    assert_eq!(
+        rows[0][2], 8.0,
+        "the influence radius is the weight-folded MINOR extent (4 * 2)"
+    );
+    assert_eq!(
+        rows[0][3], 4.0,
+        "slot 3 keeps the raw weight as layout parity"
+    );
+    assert_eq!(
+        shapes[0],
+        [2.0, 16.0, 8.0, 0.0],
+        "a circle ball stamps exponent 2 with the folded extents"
+    );
+    assert_eq!(rows[1][2], 5.0, "weight 1 is an identity fold");
+    assert_eq!(
+        shapes[1],
+        [5.0, 5.0, 5.0, 0.0],
+        "a squircle ball stamps its exponent and folded extents"
+    );
+    assert_eq!(
+        rows[2][2], 3.0,
+        "the influence radius is the smaller extent"
+    );
+    assert_eq!(
+        shapes[2],
+        [2.0, 6.0, 3.0, 0.0],
+        "an ellipse ball stamps exponent 2 with unequal extents"
+    );
+    assert_eq!(rows[3], [0.0; 4], "rows past the count stamp zero");
+    assert_eq!(shapes[5], [0.0; 4], "shape rows past the count stamp zero");
+    // A sub-1 tension clamps to the field's >= 1 contract (weight^(1/1) =
+    // weight).
+    let (clamped_rows, _) = super::glass::metaball_effective_rows(balls, 1, 0.5);
+    assert_eq!(
+        clamped_rows[0][2], 16.0,
+        "tension clamps to 1 before the fold (min of 8*4, 4*4)"
+    );
 }
