@@ -24,7 +24,7 @@ const MATERIAL_FILE_NAME: &str = "material.json";
 const MATERIAL_VERSION: u32 = 1;
 /// The legacy home of the material values (glassbar's settings file). Only
 /// read once, to seed the broker-owned material file on first run.
-const LEGACY_GLASSBAR_SETTINGS: &str = "org.newmoonworks.glassbar";
+const LEGACY_GLASSBAR_SETTINGS: &str = "studio.moonshift.glassbar";
 
 /// The material file's canonical location: `%LOCALAPPDATA%\LiquidGlass\\
 /// material.json`. The broker owns this file — every glass app reads (or,

@@ -1,6 +1,7 @@
 [package]
 name = "liquid-glass"
 version = "0.1.0"
+authors = ["Moonshift"]
 edition = "2021"
 description = "A reusable GPU-composited liquid glass backdrop for Tauri (and any Win32) overlay windows"
 license = "MIT"

@@ -1,6 +1,7 @@
 [package]
 name = "glass-broker"
 version = "0.1.0"
+authors = ["Moonshift"]
 edition = "2021"
 
 [[bin]]
