@@ -112,11 +112,15 @@ pub struct GlassShaderParams {
     /// away from the light (0 disables it). This is what sells the specular
     /// rim as a physically raised ridge.
     pub rim_shadow_strength: f32,
-    /// Alignment filler: HLSL packs a `float4` to the next 16-byte constant
-    /// register, so the following `float4` rows must start on a register
-    /// boundary. Keeps the Rust layout in exact parity with the shader's
-    /// cbuffer.
-    pub cbuffer_align: [f32; 1],
+    /// Interior lens refraction: the interior samples radially outward from
+    /// the shape's center (a wider backdrop field per pixel), so the content
+    /// underneath reads zoomed out / smaller. Fractional field expansion
+    /// (0.4 = the interior samples a 40% wider backdrop field), eased out
+    /// across the edge band where the rim refraction owns the look. 0
+    /// disables the lens. Fills the constant buffer row's last slot so the
+    /// following `float4` rows start on a 16-byte register boundary — exact
+    /// parity with the shader's cbuffer.
+    pub lens_strength: f32,
     /// The SHAPE REGION: the rect (in surface uv, origin top-left) the
     /// shape field lives in — (origin.x, origin.y, size.x, size.y). The
     /// identity (0, 0, 1, 1) maps the shape space onto the whole surface
@@ -239,7 +243,7 @@ impl Default for GlassShaderParams {
             vibrancy: 0.69,
             vibrancy_saturation: 0.44,
             rim_shadow_strength: 0.35,
-            cbuffer_align: [0.0; 1],
+            lens_strength: 0.0,
             // Identity shape region: the shape space spans the surface.
             shape_region: [0.0, 0.0, 1.0, 1.0],
             // Identity shape transform: the shape is drawn exactly where

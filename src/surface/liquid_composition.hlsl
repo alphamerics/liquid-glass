@@ -70,9 +70,15 @@ cbuffer GlassParams : register(b1) {
     // Strength of the rim's inner contact shadow on the side turned away
     // from the light (0 disables it).
     float rimShadowStrength;
-    // Alignment filler: a float4 packs to the next 16-byte register, so the
-    // following rows must start on one (parity with cbuffer_align).
-    float cbufferAlign;
+    // Interior lens refraction: the middle samples radially outward from
+    // the shape's center (a wider backdrop field per pixel), so the content
+    // underneath reads zoomed out / smaller. Fractional field expansion
+    // (0.4 = the interior samples a 40% wider backdrop field), eased out
+    // across the edge band where the rim refraction owns the look (0
+    // disables it). Fills the row's last slot so the shape float4 rows
+    // below start on their 16-byte register boundary (parity with
+    // GlassShaderParams).
+    float lensStrength;
     // ---- The shape engine ----
     // The SHAPE REGION: the rect (in surface uv, origin top-left) the
     // shape field lives in. Identity maps the shape space onto the whole
@@ -768,6 +774,17 @@ float4 compositeImpl(VertexOutput input, const bool lite) : SV_Target {
     float2 displacement = edgeNormal * texel * refractionStrength * edgeStrength;
     displacement += pointerVelocity * texel * pointerInfluence * edgeStrength;
     displacement += revealWarp;
+    // The interior lens: the middle samples radially OUTWARD from the
+    // shape's center (a wider backdrop field per pixel), so the content
+    // underneath reads zoomed out / smaller; the effect owns the interior
+    // and eases out across the edge band, where the rim refraction takes
+    // over. `scaledPosition * pillScaleVec` is the pixel's on-screen
+    // offset from the shape's center in region-height units — it holds
+    // through the pill scale and the shape transform (a growing glass
+    // lenses correctly at every size).
+    const float lensProfile = 1.0 - edgeStrength;
+    const float2 radialUv = scaledPosition * pillScaleVec * (shapeHeightPx * texel);
+    displacement -= radialUv * lensStrength * lensProfile;
     const float2 refractedUv = baseUv - displacement;
     // One tap into the pre-blurred Kawase backdrop — the heavy lifting (24
     // Vogel taps per pixel) now happens in the chain's low-resolution
